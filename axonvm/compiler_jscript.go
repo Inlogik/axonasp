@@ -616,6 +616,9 @@ func (c *Compiler) compileJScriptStatement(stmt jsast.Statement) {
 	case *jsast.ExportDeclaration:
 		c.compileJScriptExportDeclaration(node)
 	case *jsast.ReturnStatement:
+		if c.jsTryDepth == 0 && c.compileJScriptTailReturn(node.Argument) {
+			return
+		}
 		if node.Argument != nil {
 			c.compileJScriptExpression(node.Argument)
 		} else {
@@ -2913,10 +2916,15 @@ func (c *Compiler) compileJScriptTailReturn(argument jsast.Expression) bool {
 	if !ok {
 		return false
 	}
-	// Tail-call frame reuse currently cannot preserve closure identities and
-	// argument aliases for nested legacy JScript helpers. Compile ordinary
-	// calls until that optimization can prove the frame is safe to recycle.
-	return false
+	// A function literal passed to the tail callee captures the current
+	// activation. Reusing that activation would let the callee overwrite values
+	// observed by the captured closure.
+	for _, argument := range callExpr.ArgumentList {
+		switch argument.(type) {
+		case *jsast.FunctionLiteral, *jsast.ArrowFunctionLiteral:
+			return false
+		}
+	}
 	// Keep ordinary return-call semantics for Function.call/apply. These
 	// helpers invoke another function synchronously, and turning the helper
 	// itself into a tail call loses the wrapped result in nested calls.

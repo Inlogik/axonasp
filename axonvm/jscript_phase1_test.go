@@ -765,7 +765,8 @@ func TestJScriptMathLog0(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := "-Infinity"
+	// Microsoft JScript formats negative infinity using its legacy token.
+	expected := "-1.#INF"
 	if out != expected {
 		t.Errorf("expected %q, got %q", expected, out)
 	}
