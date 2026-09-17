@@ -86,6 +86,7 @@ func NewWebHost(w http.ResponseWriter, r *http.Request) *WebHost {
 	host.response.SetMaxBufferBytes(ResponseBufferLimitBytes)
 	host.request.SetHTTPRequest(r)
 	host.server.SetRootDir(RootDir)
+	host.server.SetUnrestrictedFS(AllowExternalFilesystemAccess)
 	host.server.SetRequestPath(r.URL.Path)
 	_ = host.server.SetScriptTimeout(ScriptTimeout)
 

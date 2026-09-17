@@ -76,6 +76,7 @@ var (
 	ScriptTimeout                 = 60 // in seconds
 	ResponseBufferLimitBytes      = 4 * 1024 * 1024
 	DebugASP                      = false
+	AllowExternalFilesystemAccess = false
 	CleanupSessions               = true
 	CleanupCache                  = true
 	DefaultTimezone               = "UTC"
@@ -154,6 +155,7 @@ func loadServerConfig() {
 		axonvm.SetInternalErrorLogRootPath(workingDir)
 	}
 	DebugASP = v.GetBool("global.enable_asp_debugging")
+	AllowExternalFilesystemAccess = v.GetBool("server.allow_external_filesystem_access")
 	axonvm.SetInternalErrorLogEnabled(v.GetBool("global.enable_error_log_file"))
 	axonvm.SetDumpPreprocessedSourceEnabled(v.GetBool("global.dump_preprocessed_source"))
 
