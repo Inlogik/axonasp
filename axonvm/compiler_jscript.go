@@ -38,9 +38,13 @@ import (
 	jsunistring "g3pix.com.br/axonasp/v2/jscript/unistring"
 )
 
-var jscriptCallAssignmentAnchorPattern = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\(\s*((?:"[^"]*"|'[^']*'|[^'")\s]+)(?:\s*,\s*(?:"[^"]*"|'[^']*'|[^'")\s]+))*)\s*\)\s*=\s+([^;\r\n]+);`)
+var jscriptDynamicCollectionAssignmentAnchorPattern = regexp.MustCompile(`^(Application|Session|Response\.Cookies)\s*\(\s*(.*)\s*\)\s*=\s+([^;\r\n]+);`)
+var jscriptCallAssignmentAnchorPattern = regexp.MustCompile(`^([A-Za-z_$][A-Za-z0-9_$.]*)\s*\(\s*((?:"[^"]*"|'[^']*'|[^'")\s]+)(?:\s*,\s*(?:"[^"]*"|'[^']*'|[^'")\s]+))*)\s*\)\s*=\s+([^;\r\n]+);`)
+var jscriptQualifiedFunctionPattern = regexp.MustCompile(`\bfunction\s+([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+)\s*\(`)
+var jscriptArgumentsIdentifierPattern = regexp.MustCompile(`\barguments\b`)
 
 const jsRestParamTemplatePrefix = "__js_rest__:"
+const jsLocalNameTemplatePrefix = "__js_local_name__:"
 
 func normalizeJScriptCompileLineAnchors(anchors []jscriptCompileLineAnchor) []jscriptCompileLineAnchor {
 	if len(anchors) == 0 {
@@ -92,7 +96,9 @@ func (c *Compiler) compileJScriptBlockWithLineAnchors(source string, anchors []j
 	// Classic ASP JScript commonly uses indexed default-property assignment syntax
 	// like Session("key") = value; normalize it into Session("key", value);
 	// so the GoJa parser accepts it and dispatchNativeCall(member="") can execute it.
+	source = normalizeJScriptStringContinuations(source)
 	source = normalizeJScriptCollectionAssignments(source)
+	source = normalizeJScriptQualifiedFunctionDeclarations(source)
 
 	prevAnchors := c.jsCompileLineAnchors
 	c.jsCompileLineAnchors = normalizeJScriptCompileLineAnchors(anchors)
@@ -203,7 +209,9 @@ func (c *Compiler) compileJScriptEvalSnippet(source string) (err error) {
 		}
 	}()
 
+	source = normalizeJScriptStringContinuations(source)
 	source = normalizeJScriptCollectionAssignments(source)
+	source = normalizeJScriptQualifiedFunctionDeclarations(source)
 
 	program, parseErr := jsparser.ParseFile(nil, c.sourceName, source, jsparser.ModeTopLevelAwait)
 	if parseErr != nil {
@@ -608,9 +616,6 @@ func (c *Compiler) compileJScriptStatement(stmt jsast.Statement) {
 	case *jsast.ExportDeclaration:
 		c.compileJScriptExportDeclaration(node)
 	case *jsast.ReturnStatement:
-		if c.jsTryDepth == 0 && c.compileJScriptTailReturn(node.Argument) {
-			return
-		}
 		if node.Argument != nil {
 			c.compileJScriptExpression(node.Argument)
 		} else {
@@ -2433,7 +2438,30 @@ func (c *Compiler) compileJScriptAssignment(node *jsast.AssignExpression) {
 			return
 		}
 		c.compileJScriptExpression(left.Left)
+		if node.Operator != jstoken.ASSIGN {
+			c.emit(OpJSDup)
+			c.emitJSMemberGet(c.addConstant(NewString(left.Identifier.Name.String())))
+		}
 		c.compileJScriptExpression(node.Right)
+		if node.Operator != jstoken.ASSIGN {
+			switch node.Operator {
+			case jstoken.ADD_ASSIGN, jstoken.PLUS:
+				c.emit(OpJSAdd)
+			case jstoken.SUBTRACT_ASSIGN, jstoken.MINUS:
+				c.emit(OpJSSubtract)
+			case jstoken.MULTIPLY_ASSIGN, jstoken.MULTIPLY:
+				c.emit(OpJSMultiply)
+			case jstoken.QUOTIENT_ASSIGN, jstoken.SLASH:
+				c.emit(OpJSDivide)
+			case jstoken.REMAINDER_ASSIGN, jstoken.REMAINDER:
+				c.emit(OpJSModulo)
+			case jstoken.EXPONENT_ASSIGN, jstoken.EXPONENT:
+				c.emit(OpJSExponent)
+			default:
+				c.emit(OpJSPop)
+				c.emit(OpJSLoadUndefined)
+			}
+		}
 		c.emitJSMemberSetRetainValue(c.addConstant(NewString(left.Identifier.Name.String())))
 	case *jsast.BracketExpression:
 		if _, ok := left.Left.(*jsast.SuperExpression); ok {
@@ -2885,6 +2913,19 @@ func (c *Compiler) compileJScriptTailReturn(argument jsast.Expression) bool {
 	if !ok {
 		return false
 	}
+	// Tail-call frame reuse currently cannot preserve closure identities and
+	// argument aliases for nested legacy JScript helpers. Compile ordinary
+	// calls until that optimization can prove the frame is safe to recycle.
+	return false
+	// Keep ordinary return-call semantics for Function.call/apply. These
+	// helpers invoke another function synchronously, and turning the helper
+	// itself into a tail call loses the wrapped result in nested calls.
+	if dot, ok := callExpr.Callee.(*jsast.DotExpression); ok {
+		member := dot.Identifier.Name.String()
+		if strings.EqualFold(member, "call") || strings.EqualFold(member, "apply") {
+			return false
+		}
+	}
 
 	switch callee := callExpr.Callee.(type) {
 	case *jsast.DotExpression:
@@ -2997,6 +3038,14 @@ func (c *Compiler) compileJScriptFunctionLiteral(fn *jsast.FunctionLiteral, fall
 	c.emit(OpJSReturn)
 	bodyEnd := len(c.bytecode)
 	localCount := c.jsLocalSlotCount
+	localNames := make([]string, localCount)
+	for _, scope := range c.jsLocalScopeStack {
+		for localName, slot := range scope.entries {
+			if slot >= 0 && slot < localCount {
+				localNames[slot] = localName
+			}
+		}
+	}
 	if c.jsLocalEnabled {
 		c.jsPopLocalScope()
 	}
@@ -3087,8 +3136,16 @@ func (c *Compiler) compileJScriptFunctionLiteral(fn *jsast.FunctionLiteral, fall
 	if fn.Async {
 		params = append(params, jsAsyncFlag)
 	}
+	if fn.Source == "" || jscriptArgumentsIdentifierPattern.MatchString(fn.Source) {
+		params = append(params, jsUsesArgumentsFlag)
+	}
 	if localCount > 0 {
 		params = append(params, "__js_local_count__:"+strconv.Itoa(localCount))
+		for slot, localName := range localNames {
+			if localName != "" {
+				params = append(params, jsLocalNameTemplatePrefix+strconv.Itoa(slot)+":"+base64.StdEncoding.EncodeToString([]byte(localName)))
+			}
+		}
 	}
 	if fn.Source != "" {
 		params = append(params, jsFunctionSourceMetaPrefix+base64.StdEncoding.EncodeToString([]byte(fn.Source)))
@@ -4084,6 +4141,9 @@ func normalizeJScriptCollectionAssignments(source string) string {
 					i += 2
 					continue
 				}
+				if source[i] == '\r' || source[i] == '\n' {
+					break
+				}
 				if source[i] == '"' {
 					result.WriteByte('"')
 					i++
@@ -4104,6 +4164,9 @@ func normalizeJScriptCollectionAssignments(source string) string {
 					result.WriteByte(source[i+1])
 					i += 2
 					continue
+				}
+				if source[i] == '\r' || source[i] == '\n' {
+					break
 				}
 				if source[i] == '\'' {
 					result.WriteByte('\'')
@@ -4144,8 +4207,12 @@ func normalizeJScriptCollectionAssignments(source string) string {
 			continue
 		}
 
-		// Try matching anchored assignment pattern
-		if loc := jscriptCallAssignmentAnchorPattern.FindStringSubmatchIndex(source[i:]); loc != nil {
+		// Try matching anchored assignment pattern.
+		loc := jscriptDynamicCollectionAssignmentAnchorPattern.FindStringSubmatchIndex(source[i:])
+		if loc == nil {
+			loc = jscriptCallAssignmentAnchorPattern.FindStringSubmatchIndex(source[i:])
+		}
+		if loc != nil {
 			name := source[i+loc[2] : i+loc[3]]
 			args := source[i+loc[4] : i+loc[5]]
 			val := source[i+loc[6] : i+loc[7]]
@@ -4162,5 +4229,93 @@ func normalizeJScriptCollectionAssignments(source string) string {
 		result.WriteByte(source[i])
 		i++
 	}
+	return result.String()
+}
+
+// normalizeJScriptQualifiedFunctionDeclarations preserves the legacy
+// Microsoft JScript extension `function Object.method(...) { ... }` by
+// translating it to the equivalent property assignment before ES parsing.
+func normalizeJScriptQualifiedFunctionDeclarations(source string) string {
+	return jscriptQualifiedFunctionPattern.ReplaceAllString(source, `$1 = function(`)
+}
+
+// normalizeJScriptStringContinuations accepts the Microsoft JScript extension
+// that permits horizontal whitespace between a trailing backslash and the line
+// terminator. ECMAScript parsers require the line terminator to immediately
+// follow the backslash. Removing only that whitespace preserves line numbers
+// and the value of the resulting string.
+func normalizeJScriptStringContinuations(source string) string {
+	const (
+		jsCode = iota
+		jsSingleQuotedString
+		jsDoubleQuotedString
+		jsLineComment
+		jsBlockComment
+	)
+
+	var result strings.Builder
+	result.Grow(len(source))
+	state := jsCode
+
+	for i := 0; i < len(source); {
+		ch := source[i]
+		switch state {
+		case jsCode:
+			if ch == '\'' {
+				state = jsSingleQuotedString
+			} else if ch == '"' {
+				state = jsDoubleQuotedString
+			} else if ch == '/' && i+1 < len(source) && source[i+1] == '/' {
+				result.WriteString("//")
+				i += 2
+				state = jsLineComment
+				continue
+			} else if ch == '/' && i+1 < len(source) && source[i+1] == '*' {
+				result.WriteString("/*")
+				i += 2
+				state = jsBlockComment
+				continue
+			}
+		case jsSingleQuotedString, jsDoubleQuotedString:
+			quote := byte('\'')
+			if state == jsDoubleQuotedString {
+				quote = '"'
+			}
+			if ch == quote {
+				state = jsCode
+			} else if ch == '\\' {
+				j := i + 1
+				for j < len(source) && (source[j] == ' ' || source[j] == '\t' || source[j] == '\f' || source[j] == '\v') {
+					j++
+				}
+				if j < len(source) && (source[j] == '\r' || source[j] == '\n') {
+					result.WriteByte(ch)
+					i = j
+					continue
+				}
+				result.WriteByte(ch)
+				i++
+				if i < len(source) {
+					result.WriteByte(source[i])
+					i++
+				}
+				continue
+			}
+		case jsLineComment:
+			if ch == '\r' || ch == '\n' {
+				state = jsCode
+			}
+		case jsBlockComment:
+			if ch == '*' && i+1 < len(source) && source[i+1] == '/' {
+				result.WriteString("*/")
+				i += 2
+				state = jsCode
+				continue
+			}
+		}
+		result.WriteByte(ch)
+		i++
+	}
+
 	return result.String()
 }

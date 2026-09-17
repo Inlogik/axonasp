@@ -100,6 +100,18 @@ func TestJScriptMemberAssignmentExpressionValue(t *testing.T) {
 	}
 }
 
+func TestJScriptCompoundMemberAssignmentUsesExistingValue(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`var options = { clause: " order by records.id" };` +
+		`options.clause += " DESC";` +
+		`Response.Write(options.clause);` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != " order by records.id DESC" {
+		t.Fatalf("unexpected compound member assignment output: %q", out)
+	}
+}
+
 // TestJScriptRuntimeErrorSourceIsJScriptNotVBScript verifies that uncaught
 // JScript runtime errors are surfaced to the host with Source
 // "JScript runtime error" and Category "JScript runtime". The shared dispatch

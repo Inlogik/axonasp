@@ -411,7 +411,11 @@ func main() {
 		// Execute Application_OnStart using a dummy host
 		req, _ := http.NewRequest("GET", "http://localhost/", nil)
 		dummyHost := NewWebHost(&dummyResponseWriter{}, req)
-		_ = axonvm.GetGlobalASA().ExecuteApplicationOnStart(dummyHost)
+		dummyHost.server.SetRequestPath("/global.asa")
+		if err := axonvm.GetGlobalASA().ExecuteApplicationOnStart(dummyHost); err != nil {
+			axonvm.ReportInternalError(axonvm.HTTPInternalServerError, err, "Application_OnStart failed.", "global.asa", 0)
+			os.Exit(1)
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -804,7 +808,6 @@ func executeASPWithStatus(w http.ResponseWriter, r *http.Request, filePath strin
 	type vmResult struct{ err error }
 	done := make(chan vmResult, 1)
 	go func() {
-		defer vm.Release()
 		runErr := func() (err error) {
 			defer func() {
 				if recovered := recover(); recovered != nil {
@@ -813,6 +816,10 @@ func executeASPWithStatus(w http.ResponseWriter, r *http.Request, filePath strin
 			}()
 			return vm.Run()
 		}()
+		// Return the VM to its program pool before notifying the handler. This
+		// guarantees the next sequential request can reuse the warm VM instead
+		// of racing the deferred release and allocating a second full runtime.
+		vm.Release()
 		done <- vmResult{err: runErr}
 	}()
 

@@ -444,8 +444,8 @@ type VM struct {
 	jsSymbolStateItems             map[int64]jsObjectState
 	jsPropertyItems                map[int64]map[string]jsPropertyDescriptor
 	jsFunctionItems                map[int64]*jsFunctionObject
-	jsForInItems                   map[int]*jsForInEnumerator
-	jsForOfItems                   map[int]*jsForOfEnumerator
+	jsForInItems                   map[jsLoopEnumeratorKey]*jsForInEnumerator
+	jsForOfItems                   map[jsLoopEnumeratorKey]*jsForOfEnumerator
 	jsEnvItems                     map[int64]*jsEnvFrame
 	jsArgumentsItems               map[int64]*jsArgumentsBinding
 	jsSetItems                     map[int64]map[string]Value
@@ -794,8 +794,8 @@ func NewVM(bytecode []byte, constants []Value, globalCount int) *VM {
 		jsSymbolStateItems:             make(map[int64]jsObjectState),
 		jsPropertyItems:                make(map[int64]map[string]jsPropertyDescriptor),
 		jsFunctionItems:                make(map[int64]*jsFunctionObject),
-		jsForInItems:                   make(map[int]*jsForInEnumerator),
-		jsForOfItems:                   make(map[int]*jsForOfEnumerator),
+		jsForInItems:                   make(map[jsLoopEnumeratorKey]*jsForInEnumerator),
+		jsForOfItems:                   make(map[jsLoopEnumeratorKey]*jsForOfEnumerator),
 		jsEnvItems:                     make(map[int64]*jsEnvFrame),
 		jsArgumentsItems:               make(map[int64]*jsArgumentsBinding),
 		jsSetItems:                     make(map[int64]map[string]Value),
@@ -1620,7 +1620,7 @@ func (vm *VM) cloneForExecuteLocal(startIP int) *VM {
 		}
 		bindings := make(map[string]Value, len(env.bindings))
 		maps.Copy(bindings, env.bindings)
-		child.jsEnvItems[id] = &jsEnvFrame{parentID: env.parentID, bindings: bindings}
+		child.jsEnvItems[id] = &jsEnvFrame{parentID: env.parentID, bindings: bindings, capturedClosures: env.capturedClosures, argumentsObjID: env.argumentsObjID}
 	}
 	child.jsArgumentsItems = make(map[int64]*jsArgumentsBinding, len(vm.jsArgumentsItems))
 	for id, binding := range vm.jsArgumentsItems {
@@ -1680,6 +1680,36 @@ func (vm *VM) cloneForExecuteLocal(startIP int) *VM {
 	child.jsErrStack = make([]Value, 0, 4)
 	// stmtSP carries over from parent; child's first OpLine will reset it.
 
+	return &child
+}
+
+// cloneForExecuteLocalSharedRuntime creates the synchronous Eval/Function
+// execution context. The parent VM is suspended while this child runs, so the
+// dynamic program can share its object and lexical-environment maps directly.
+// Deep-copying those maps for every eval is prohibitively expensive in large
+// Classic ASP pages because it copies every previously created JScript object.
+func (vm *VM) cloneForExecuteLocalSharedRuntime(startIP int) *VM {
+	vm.cloneForExecuteLocalCount++
+	child := *vm
+	child.parentVM = vm
+	child.stack = make([]Value, len(vm.stack))
+	copy(child.stack, vm.stack)
+	child.jsCallStack = make([]jsCallFrame, len(vm.jsCallStack))
+	copy(child.jsCallStack, vm.jsCallStack)
+	child.globalTypes = append([]ValueType(nil), vm.globalTypes...)
+	child.ip = startIP
+	child.callStack = append([]CallFrame(nil), vm.callStack...)
+	child.activeClassObjectID = vm.activeClassObjectID
+	child.terminateCursor = -1
+	child.terminatePrepared = false
+	child.suppressTerminate = true
+	child.onResumeNext = vm.onResumeNext
+	child.skipToNextStmt = false
+	child.jsTryStack = make([]int, 0, 8)
+	child.jsErrStack = make([]Value, 0, 4)
+	if len(vm.icState) > 0 {
+		child.icState = append([]InlineCacheSlot(nil), vm.icState...)
+	}
 	return &child
 }
 
@@ -4544,6 +4574,13 @@ aspExecLoop:
 			target := vm.pop()
 			member := vm.constants[nameIdx].Str
 			stackLen := len(vm.jsCallStack)
+			if (target.Type == VTJSObject || target.Type == VTJSFunction) && vm.jsObjectStringProperty(target, "__js_type") == "" {
+				if callee, thisVal, ok, deferred := vm.jsPrepareMemberCallee(target, member); deferred {
+					continue
+				} else if ok && vm.jsBeginDirectCall(callee, thisVal, args) {
+					continue
+				}
+			}
 			if result, handled := vm.jsCallMember(target, member, args); handled {
 				if len(vm.jsCallStack) == stackLen || result.Type != VTJSUndefined {
 					vm.push(result)
@@ -4563,6 +4600,13 @@ aspExecLoop:
 			target := vm.pop()
 			key := vm.jsPropertyKeyFromValue(keyVal)
 			stackLen := len(vm.jsCallStack)
+			if (target.Type == VTJSObject || target.Type == VTJSFunction) && vm.jsObjectStringProperty(target, "__js_type") == "" {
+				if callee, thisVal, ok, deferred := vm.jsPrepareMemberCallee(target, key); deferred {
+					continue
+				} else if ok && vm.jsBeginDirectCall(callee, thisVal, args) {
+					continue
+				}
+			}
 			if result, handled := vm.jsCallMember(target, key, args); handled {
 				if len(vm.jsCallStack) == stackLen || result.Type != VTJSUndefined {
 					vm.push(result)
@@ -4582,6 +4626,15 @@ aspExecLoop:
 			}
 			target := vm.pop()
 			member := vm.constants[nameIdx].Str
+			// Function.prototype.call/apply are dispatch helpers, not ordinary
+			// callees. Resolve them before tail-call preparation so the wrapped
+			// function's return value is propagated to the current caller.
+			if target.Type == VTJSFunction && (strings.EqualFold(member, "call") || strings.EqualFold(member, "apply")) {
+				if result, handled := vm.jsCallMember(target, member, args); handled {
+					vm.jsReturn(result)
+					continue
+				}
+			}
 			if callee, thisVal, ok, deferred := vm.jsPrepareMemberCallee(target, member); deferred {
 				vm.jsReturn(Value{Type: VTJSUndefined})
 			} else if ok {
@@ -5040,7 +5093,7 @@ aspExecLoop:
 		case OpJSForInCleanup:
 			forInPos := int(binary.BigEndian.Uint32(vm.bytecode[vm.ip:]))
 			vm.ip += 4
-			delete(vm.jsForInItems, forInPos)
+			delete(vm.jsForInItems, jsLoopEnumeratorKey{opPos: forInPos, envID: vm.jsActiveEnvID})
 			if vm.sp >= 0 {
 				vm.pop()
 			}
@@ -5052,7 +5105,8 @@ aspExecLoop:
 			vm.ip += 4
 
 			opPos := vm.ip - 7
-			enumState := vm.jsForInItems[opPos]
+			enumKey := jsLoopEnumeratorKey{opPos: opPos, envID: vm.jsActiveEnvID}
+			enumState := vm.jsForInItems[enumKey]
 			if enumState == nil {
 				if vm.sp < 0 {
 					vm.ip = exitTarget
@@ -5061,11 +5115,11 @@ aspExecLoop:
 				source := vm.stack[vm.sp]
 				keys := vm.jsEnumerateForInKeys(source)
 				enumState = &jsForInEnumerator{keys: keys, index: 0}
-				vm.jsForInItems[opPos] = enumState
+				vm.jsForInItems[enumKey] = enumState
 			}
 
 			if enumState.index >= len(enumState.keys) {
-				delete(vm.jsForInItems, opPos)
+				delete(vm.jsForInItems, enumKey)
 				if vm.sp >= 0 {
 					vm.pop()
 				}
@@ -5080,7 +5134,7 @@ aspExecLoop:
 			// Remove stale for-of enumerator on early exit (break/throw).
 			forOfPos := int(binary.BigEndian.Uint32(vm.bytecode[vm.ip:]))
 			vm.ip += 4
-			delete(vm.jsForOfItems, forOfPos)
+			delete(vm.jsForOfItems, jsLoopEnumeratorKey{opPos: forOfPos, envID: vm.jsActiveEnvID})
 			if vm.sp >= 0 {
 				vm.pop()
 			}
@@ -5094,7 +5148,8 @@ aspExecLoop:
 			vm.ip += 4
 
 			opPos := vm.ip - 7
-			foState := vm.jsForOfItems[opPos]
+			foKey := jsLoopEnumeratorKey{opPos: opPos, envID: vm.jsActiveEnvID}
+			foState := vm.jsForOfItems[foKey]
 			if foState == nil {
 				// First encounter: collect iterable values and pop the source.
 				if vm.sp < 0 {
@@ -5104,12 +5159,12 @@ aspExecLoop:
 				source := vm.stack[vm.sp]
 				values := vm.jsEnumerateForOfValues(source)
 				foState = &jsForOfEnumerator{values: values, index: 0}
-				vm.jsForOfItems[opPos] = foState
+				vm.jsForOfItems[foKey] = foState
 			}
 
 			if foState.index >= len(foState.values) {
 				// Exhausted: clean up and jump past the loop.
-				delete(vm.jsForOfItems, opPos)
+				delete(vm.jsForOfItems, foKey)
 				if vm.sp >= 0 {
 					vm.pop()
 				}
@@ -6614,12 +6669,34 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		switch {
 		case member == "":
 			if len(args) >= 1 {
-				return NewString(request.GetValue(args[0].String()))
+				key := args[0].String()
+				if value, ok := request.QueryString.GetValue(key); ok {
+					return vm.newRequestCollectionValueItem(value)
+				}
+				if !request.IsBinaryReadUsed() {
+					request.MarkFormUsed()
+					if value, ok := request.Form.GetValue(key); ok {
+						return vm.newRequestCollectionValueItem(value)
+					}
+				}
+				if value, ok := request.Cookies.GetValue(key); ok {
+					return vm.newRequestCollectionValueItem(value)
+				}
+				if value, ok := request.ClientCertificate.GetValue(key); ok {
+					return vm.newRequestCollectionValueItem(value)
+				}
+				if value, ok := request.ServerVars.GetValue(key); ok {
+					return vm.newRequestCollectionValueItem(value)
+				}
+				// Request("missing") is still an IIS Request collection value.
+				// Preserve that distinction so string coercion yields "" while
+				// numeric JScript coercion yields NaN rather than zero.
+				return vm.newRequestCollectionValueItem(asp.RequestCollectionValue{})
 			}
 			return emptyForCtx()
 		case strings.EqualFold(member, "QueryString"):
 			if len(args) >= 1 {
-				if value, ok := request.QueryString.GetValue(args[0].String()); ok {
+				if value, ok := request.QueryString.GetSelectedValue(args[0].String()); ok {
 					return vm.newRequestCollectionValueItem(value)
 				}
 				return emptyForCtx()
@@ -6631,7 +6708,7 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 					return emptyForCtx()
 				}
 				request.MarkFormUsed()
-				if value, ok := request.Form.GetValue(args[0].String()); ok {
+				if value, ok := request.Form.GetSelectedValue(args[0].String()); ok {
 					return vm.newRequestCollectionValueItem(value)
 				}
 				return emptyForCtx()
@@ -6639,7 +6716,7 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 			return emptyForCtx()
 		case strings.EqualFold(member, "Cookies"):
 			if len(args) == 1 {
-				if value, ok := request.Cookies.GetValue(args[0].String()); ok {
+				if value, ok := request.Cookies.GetSelectedValue(args[0].String()); ok {
 					return vm.newRequestCollectionValueItem(value)
 				}
 				return emptyForCtx()
@@ -6650,18 +6727,24 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 			return emptyForCtx()
 		case strings.EqualFold(member, "ServerVariables"):
 			if len(args) >= 1 {
-				if value, ok := request.ServerVars.GetValue(args[0].String()); ok {
+				if value, ok := request.ServerVars.GetSelectedValue(args[0].String()); ok {
 					return vm.newRequestCollectionValueItem(value)
 				}
-				return emptyForCtx()
+				if vm.engineMode == EngineModeJavaScript {
+					return Value{Type: VTJSUndefined}
+				}
+				return Value{Type: VTEmpty}
 			}
 			return Value{Type: VTNativeObject, Num: nativeRequestServerVariables}
 		case strings.EqualFold(member, "ClientCertificate"):
 			if len(args) >= 1 {
-				if value, ok := request.ClientCertificate.GetValue(args[0].String()); ok {
+				if value, ok := request.ClientCertificate.GetSelectedValue(args[0].String()); ok {
 					return vm.newRequestCollectionValueItem(value)
 				}
-				return emptyForCtx()
+				if vm.engineMode == EngineModeJavaScript {
+					return Value{Type: VTJSUndefined}
+				}
+				return Value{Type: VTEmpty}
 			}
 			return Value{Type: VTNativeObject, Num: nativeRequestClientCertificate}
 		case strings.EqualFold(member, "TotalBytes"):
@@ -6735,7 +6818,7 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		}
 	case nativeRequestQueryString:
 		if (member == "" || strings.EqualFold(member, "Item")) && len(args) >= 1 {
-			value, _ := vm.host.Request().QueryString.GetValue(args[0].String())
+			value, _ := vm.host.Request().QueryString.GetSelectedValue(args[0].String())
 			return vm.newRequestCollectionValueItem(value)
 		}
 		if strings.EqualFold(member, "Count") {
@@ -6751,7 +6834,7 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 				return vm.newRequestCollectionValueItem(asp.RequestCollectionValue{})
 			}
 			vm.host.Request().MarkFormUsed()
-			value, _ := vm.host.Request().Form.GetValue(args[0].String())
+			value, _ := vm.host.Request().Form.GetSelectedValue(args[0].String())
 			return vm.newRequestCollectionValueItem(value)
 		}
 		if strings.EqualFold(member, "Count") {
@@ -6771,7 +6854,7 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		return Value{Type: VTEmpty}
 	case nativeRequestCookies:
 		if (member == "" || strings.EqualFold(member, "Item")) && len(args) == 1 {
-			value, _ := vm.host.Request().Cookies.GetValue(args[0].String())
+			value, _ := vm.host.Request().Cookies.GetSelectedValue(args[0].String())
 			return vm.newRequestCollectionValueItem(value)
 		}
 		if (member == "" || strings.EqualFold(member, "Item")) && len(args) >= 2 {
@@ -6786,10 +6869,13 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		return Value{Type: VTEmpty}
 	case nativeRequestServerVariables:
 		if (member == "" || strings.EqualFold(member, "Item")) && len(args) >= 1 {
-			if value, ok := vm.host.Request().ServerVars.GetValue(args[0].String()); ok {
+			if value, ok := vm.host.Request().ServerVars.GetSelectedValue(args[0].String()); ok {
 				return vm.newRequestCollectionValueItem(value)
 			}
-			return emptyForCtx()
+			if vm.engineMode == EngineModeJavaScript {
+				return Value{Type: VTJSUndefined}
+			}
+			return Value{Type: VTEmpty}
 		}
 		if strings.EqualFold(member, "Count") {
 			return NewInteger(int64(vm.host.Request().ServerVars.Count()))
@@ -6800,10 +6886,13 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		return Value{Type: VTEmpty}
 	case nativeRequestClientCertificate:
 		if (member == "" || strings.EqualFold(member, "Item")) && len(args) >= 1 {
-			if value, ok := vm.host.Request().ClientCertificate.GetValue(args[0].String()); ok {
+			if value, ok := vm.host.Request().ClientCertificate.GetSelectedValue(args[0].String()); ok {
 				return vm.newRequestCollectionValueItem(value)
 			}
-			return emptyForCtx()
+			if vm.engineMode == EngineModeJavaScript {
+				return Value{Type: VTJSUndefined}
+			}
+			return Value{Type: VTEmpty}
 		}
 		if strings.EqualFold(member, "Count") {
 			return NewInteger(int64(vm.host.Request().ClientCertificate.Count()))
@@ -6871,7 +6960,16 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 			return NewString("")
 		case strings.EqualFold(member, "MapPath"):
 			if len(args) >= 1 {
-				return NewString(server.MapPath(args[0].String()))
+				path := args[0].String()
+				if !filepath.IsAbs(path) && !strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "\\") {
+					if sourceFile, _ := vm.mappedCurrentLocation(); strings.TrimSpace(sourceFile) != "" {
+						virtualSource := server.VirtualPathFromAbsolutePath(sourceFile)
+						if virtualSource != "" {
+							path = filepath.ToSlash(filepath.Join(filepath.Dir(virtualSource), path))
+						}
+					}
+				}
+				return NewString(server.MapPath(path))
 			}
 			return NewString(server.MapPath(""))
 		case strings.EqualFold(member, "IsClientConnected"):
@@ -8423,12 +8521,25 @@ func (vm *VM) valueToString(v Value) string {
 // valueToResponseString applies Response.Write coercion rules for mixed VBScript/JScript values.
 func (vm *VM) valueToResponseString(v Value) string {
 	v = resolveCallable(vm, v)
+	// JScript ASP expression blocks use the JScript string conversion rules.
+	// SQL NULLs reach them as VTNull, which must render as "null" so legacy
+	// isNull helpers can recognize and replace the value.
+	if v.Type == VTNull && (vm.engineMode == EngineModeJavaScript || len(vm.jsCallStack) > 0 || vm.jsActiveEnvID != 0 || vm.jsRootEnvID != 0) {
+		return "null"
+	}
 	isJS := vm.engineMode == EngineModeJavaScript || len(vm.jsCallStack) > 0 || vm.jsActiveEnvID != 0 || vm.jsRootEnvID != 0
 	if !isJS {
 		return vm.valueToString(v)
 	}
 
 	switch v.Type {
+	case VTInteger:
+		if v.Num >= 1000000000000000 || v.Num <= -1000000000000000 {
+			return formatMicrosoftJScriptResponseDouble(float64(v.Num))
+		}
+		return strconv.FormatInt(v.Num, 10)
+	case VTDouble:
+		return formatMicrosoftJScriptResponseDouble(v.Flt)
 	case VTArray:
 		return vm.jsArrayToString(v)
 	case VTJSFunction:
@@ -8436,7 +8547,11 @@ func (vm *VM) valueToResponseString(v Value) string {
 			return vm.valueToString(out)
 		}
 		return vm.jsToString(v)
-	case VTJSProxy, VTJSUndefined:
+	case VTJSUndefined:
+		// Microsoft JScript writes undefined as an empty value through both
+		// Response.Write(undefined) and ASP expression blocks (<%= undefined %>).
+		return ""
+	case VTJSProxy:
 		return vm.jsToString(v)
 	case VTJSObject:
 		objType := vm.jsObjectStringProperty(v, "__js_type")
@@ -8453,6 +8568,50 @@ func (vm *VM) valueToResponseString(v Value) string {
 	default:
 		return vm.valueToString(v)
 	}
+}
+
+// formatMicrosoftJScriptResponseDouble reproduces the legacy numeric
+// formatting Microsoft JScript applies when Response.Write receives a Number
+// directly. Explicit String(number) and concatenation use normal ECMAScript
+// formatting instead.
+func formatMicrosoftJScriptResponseDouble(value float64) string {
+	if math.IsNaN(value) {
+		return "-1.#IND"
+	}
+	if math.IsInf(value, 1) {
+		return "1.#INF"
+	}
+	if math.IsInf(value, -1) {
+		return "-1.#INF"
+	}
+	if value == 0 {
+		return "0"
+	}
+
+	absValue := math.Abs(value)
+	if absValue >= 1e15 {
+		formatted := strconv.FormatFloat(value, 'E', 14, 64)
+		parts := strings.SplitN(formatted, "E", 2)
+		parts[0] = strings.TrimRight(strings.TrimRight(parts[0], "0"), ".")
+		exponent := parts[1]
+		sign := exponent[:1]
+		digits := strings.TrimLeft(exponent[1:], "0")
+		if digits == "" {
+			digits = "0"
+		}
+		return parts[0] + "E" + sign + digits
+	}
+
+	integerDigits := 0
+	if absValue >= 1 {
+		integerDigits = int(math.Floor(math.Log10(absValue))) + 1
+	}
+	decimalPlaces := 15 - integerDigits
+	if absValue < 1 {
+		decimalPlaces = 14 - int(math.Floor(math.Log10(absValue)))
+	}
+	formatted := strconv.FormatFloat(value, 'f', decimalPlaces, 64)
+	return strings.TrimRight(strings.TrimRight(formatted, "0"), ".")
 }
 
 // newRequestCollectionValueItem creates one native object wrapper for one Request collection entry value.
@@ -8810,7 +8969,10 @@ func (vm *VM) valueToApplicationValue(v Value) asp.ApplicationValue {
 		if v.Num == 0 {
 			return asp.NewApplicationNothing()
 		}
-		return asp.NewApplicationJSObject(v.Num, v.Str, v.Interface)
+		// Session and Application values outlive the VM that created them. A raw
+		// JScript object ID is only meaningful inside that VM, so retain a
+		// self-contained representation for later requests.
+		return asp.NewApplicationJSObject(0, vm.jsJSONStringify(v), "application/json")
 	case VTArray:
 		if v.Arr != nil {
 			return vm.vbArrayToApplicationValue(v.Arr)
@@ -8858,6 +9020,9 @@ func (vm *VM) applicationValueToValue(v asp.ApplicationValue) Value {
 	case asp.ApplicationValueObject:
 		return Value{Type: VTObject, Num: v.Num, Str: v.Str, Interface: v.Interface}
 	case asp.ApplicationValueJSObject:
+		if v.Interface == "application/json" && v.Str != "" {
+			return vm.jsJSONParse(v.Str)
+		}
 		return Value{Type: VTJSObject, Num: v.Num, Str: v.Str, Interface: v.Interface}
 	case asp.ApplicationValueNothing:
 		return Value{Type: VTNothing}

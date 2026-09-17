@@ -1423,6 +1423,65 @@ Response.Write "Name=" & rs.Fields.Item("Nome")
 	}
 }
 
+// TestJScriptExpressionBlockNullCoercion verifies SQL NULLs are rendered with
+// JScript semantics so generic null-handling helpers can recognize them.
+func TestJScriptExpressionBlockNullCoercion(t *testing.T) {
+	source := `<%@ language="JavaScript" %><% var value = null; %><%= value %>`
+	compiler := NewASPCompiler(source)
+	if err := compiler.Compile(); err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	vm := NewVM(compiler.Bytecode(), compiler.Constants(), compiler.GlobalsCount())
+	host := NewMockHost()
+	var output bytes.Buffer
+	host.SetOutput(&output)
+	vm.SetHost(host)
+	if err := vm.Run(); err != nil {
+		t.Fatalf("vm run failed: %v", err)
+	}
+	host.Response().Flush()
+	if output.String() != "null" {
+		t.Fatalf("expected JScript null output, got %q", output.String())
+	}
+}
+
+func TestJScriptStringCoercesNullADODBFieldToLowercaseNull(t *testing.T) {
+	vm := NewVM(nil, nil, 0)
+	rs := &adodbRecordset{
+		state:              adStateOpen,
+		currentRow:         0,
+		columns:            []string{"optional_text"},
+		data:               []map[string]Value{{"optional_text": NewNull()}},
+		columnTypeByName:   map[string]int{"optional_text": 200},
+		columnSizeByName:   map[string]int{},
+		columnAttrByName:   map[string]int{},
+		columnScaleByName:  map[string]int{},
+		fieldChunkOffset:   map[string]int{},
+		columnIndexByLower: map[string]int{"optional_text": 0},
+	}
+	field := vm.newADODBFieldProxy(rs, "optional_text")
+	if got := vm.jsToString(field); got != "null" {
+		t.Fatalf("expected lowercase JScript null, got %q", got)
+	}
+}
+
+func TestJScriptUnaryPlusCoercesADODBFieldValue(t *testing.T) {
+	vm := NewVM(nil, nil, 0)
+	rsVal := vm.newADODBRecordset()
+	rs := vm.adodbRecordsetItems[rsVal.Num]
+	rs.columns = []string{"count"}
+	rs.data = []map[string]Value{{"count": NewInteger(5)}}
+	rs.recordCount = 1
+	rs.currentRow = 0
+	rs.state = adStateOpen
+	field := vm.newADODBFieldProxy(rs, "count")
+
+	got := vm.jsToNumber(field)
+	if got.Type != VTDouble || got.Flt != 5 {
+		t.Fatalf("unexpected ADODB numeric coercion: %#v", got)
+	}
+}
+
 // TestASPNativeObjectArgumentPassThrough verifies native objects passed as Sub
 // arguments are not coerced through __default__ before call dispatch.
 func TestASPNativeObjectArgumentPassThrough(t *testing.T) {
@@ -2137,7 +2196,7 @@ Function convertBool(value)
 
 Function cId()
 	cId = 1
-	End Function
+End Function
 
 Dim logon
 Set logon = New cls_LogonEdit

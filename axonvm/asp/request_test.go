@@ -53,6 +53,9 @@ func TestRequestCollectionAndCookieAttributes(t *testing.T) {
 	if req.GetCollectionValue("QueryString", "1") != "a, b" {
 		t.Fatalf("unexpected collection index resolution")
 	}
+	if value, ok := req.QueryString.GetSelectedValue("1"); !ok || value.Joined() != "a, b" {
+		t.Fatalf("unexpected structured collection index resolution: %#v, %v", value, ok)
+	}
 	if req.GetCookieAttribute("profile", "name") != "Lucas" {
 		t.Fatalf("unexpected cookie subkey value")
 	}
@@ -174,6 +177,16 @@ func TestRequestFormURLEncodedMultiValue(t *testing.T) {
 	}
 	if value.Item("1") != "Action" || value.Item("2") != "Comedy" {
 		t.Fatalf("unexpected movies values: %#v", value.Values)
+	}
+}
+
+func TestRequestDefaultLookupPreservesEmptyFormValuePrecedence(t *testing.T) {
+	req := NewRequest()
+	req.Form.Add("user_password", "")
+	req.Cookies.AddCookie("user_password", "cookie-password")
+
+	if got := req.GetValue("user_password"); got != "" {
+		t.Fatalf("expected present empty form value to win, got %q", got)
 	}
 }
 
