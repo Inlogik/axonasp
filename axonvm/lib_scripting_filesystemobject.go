@@ -1506,6 +1506,10 @@ func (vm *VM) fsoResolvePath(path string) (string, bool) {
 	if trimmed == "" {
 		return "", false
 	}
+	// Classic ASP applications commonly construct filesystem paths with the
+	// Windows separator. Treat it as a separator on every supported host before
+	// resolving and sandboxing the path.
+	trimmed = strings.ReplaceAll(trimmed, "\\", string(os.PathSeparator))
 
 	rootPath := vm.host.Server().MapPath("/")
 	currentDir := ""
