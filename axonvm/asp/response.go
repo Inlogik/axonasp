@@ -249,8 +249,9 @@ func (r *Response) BinaryWrite(data []byte) {
 	}
 }
 
-// AddHeader appends an HTTP header if output was not flushed yet. Classic ASP
-// permits repeated headers, notably multiple Set-Cookie values.
+// AddHeader adds an HTTP header if output was not flushed yet. Classic ASP
+// permits repeated Set-Cookie values, but a later value for the same cookie
+// name replaces the earlier pending value.
 func (r *Response) AddHeader(name string, value string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -260,8 +261,39 @@ func (r *Response) AddHeader(name string, value string) {
 	}
 	if strings.EqualFold(name, "Set-Cookie") {
 		value = normalizeSetCookiePath(value)
+		replaceSetCookieHeader(r.headers, value)
+		return
 	}
 	r.headers.Add(name, value)
+}
+
+func replaceSetCookieHeader(headers http.Header, value string) {
+	name := setCookieName(value)
+	if name == "" {
+		headers.Add("Set-Cookie", value)
+		return
+	}
+
+	existing := headers.Values("Set-Cookie")
+	headers.Del("Set-Cookie")
+	for _, current := range existing {
+		if !strings.EqualFold(setCookieName(current), name) {
+			headers.Add("Set-Cookie", current)
+		}
+	}
+	headers.Add("Set-Cookie", value)
+}
+
+func setCookieName(value string) string {
+	pair := value
+	if separator := strings.IndexByte(pair, ';'); separator >= 0 {
+		pair = pair[:separator]
+	}
+	equals := strings.IndexByte(pair, '=')
+	if equals <= 0 {
+		return ""
+	}
+	return strings.TrimSpace(pair[:equals])
 }
 
 // normalizeSetCookiePath prevents legacy apps that concatenate a customer
