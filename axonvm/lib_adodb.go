@@ -3592,7 +3592,17 @@ func adodbNormalizeCommandText(sqlText string, driver string) string {
 	if len(match) != 2 {
 		return sqlText
 	}
-	return "EXEC " + strings.TrimSpace(match[1])
+	call := strings.TrimSpace(match[1])
+	open := strings.IndexByte(call, '(')
+	if open < 0 || !strings.HasSuffix(call, ")") {
+		return "EXEC " + call
+	}
+	procedure := strings.TrimSpace(call[:open])
+	arguments := strings.TrimSpace(call[open+1 : len(call)-1])
+	if arguments == "" {
+		return "EXEC " + procedure
+	}
+	return "EXEC " + procedure + " " + arguments
 }
 
 // adodbNormalizeRecordsetSource rewrites bare table names passed to Recordset.Open
