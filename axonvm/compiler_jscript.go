@@ -584,7 +584,9 @@ func (c *Compiler) compileJScriptStatement(stmt jsast.Statement) {
 					}
 				}
 			} else {
-				// var x; -> declare x
+				// var declarations were emitted by hoistJScriptDeclarations before
+				// statement execution. An uninitialized declaration has no runtime
+				// work, including when the same include declares it again.
 				if id, ok := binding.Target.(*jsast.Identifier); ok {
 					if slot, hasLocal := c.jsResolveLocalSlot(id.Name.String()); hasLocal {
 						_ = slot
@@ -595,8 +597,6 @@ func (c *Compiler) compileJScriptStatement(stmt jsast.Statement) {
 							continue
 						}
 					}
-					nameIdx := c.addConstant(NewString(id.Name.String()))
-					c.emit(OpJSDeclareName, nameIdx)
 				}
 			}
 		}
@@ -3404,7 +3404,9 @@ func (c *Compiler) compileJScriptDestructuring(target jsast.Expression, isConst 
 					break
 				}
 			}
-			c.emit(OpJSDeclareName, nameIdx)
+			// The enclosing program/function hoist already emitted the binding.
+			// Keep the initializer store: repeated includes must still execute
+			// declaration initializers and any other executable side effects.
 			c.emit(OpJSSetName, nameIdx)
 		} else if isConst {
 			if c.jsLocalEnabled {
