@@ -704,7 +704,7 @@ func (vm *VM) adodbConnectionExecute(conn *adodbConnection, args []Value) Value 
 		return Value{Type: VTEmpty}
 	}
 
-	sqlText := args[0].String()
+	sqlText := adodbNormalizeCommandText(args[0].String(), conn.dbDriver)
 	isQuery := vm.adodbIsQuery(sqlText)
 	execArgs := vm.adodbExecuteArgs(args)
 	if len(args) >= 3 {
@@ -3577,6 +3577,22 @@ func (vm *VM) adodbFirstNonEmpty(values ...string) string {
 func (vm *VM) adodbIsQuery(sql string) bool {
 	s := strings.ToLower(strings.TrimSpace(sql))
 	return strings.HasPrefix(s, "select") || strings.HasPrefix(s, "show") || strings.HasPrefix(s, "pragma")
+}
+
+var adodbODBCProcedureCall = regexp.MustCompile(`(?is)^\s*\{\s*call\s+(.+?)\s*\}\s*$`)
+
+// adodbNormalizeCommandText preserves ADO's acceptance of ODBC procedure-call
+// escapes when using the native SQL Server driver. OLE DB providers perform
+// this translation themselves, while database/sql drivers expect T-SQL EXEC.
+func adodbNormalizeCommandText(sqlText string, driver string) string {
+	if !strings.EqualFold(strings.TrimSpace(driver), "mssql") {
+		return sqlText
+	}
+	match := adodbODBCProcedureCall.FindStringSubmatch(sqlText)
+	if len(match) != 2 {
+		return sqlText
+	}
+	return "EXEC " + strings.TrimSpace(match[1])
 }
 
 // adodbNormalizeRecordsetSource rewrites bare table names passed to Recordset.Open

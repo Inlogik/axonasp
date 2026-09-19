@@ -126,6 +126,20 @@ func TestADODBErrorExposesNativeError(t *testing.T) {
 	}
 }
 
+func TestADODBNormalizesODBCProcedureCallForSQLServer(t *testing.T) {
+	got := adodbNormalizeCommandText(" { call process_item('A', 2) } ", "mssql")
+	if got != "EXEC process_item('A', 2)" {
+		t.Fatalf("unexpected normalized command: %q", got)
+	}
+}
+
+func TestADODBLeavesODBCProcedureCallForOtherProviders(t *testing.T) {
+	sqlText := "{call process_item('A', 2)}"
+	if got := adodbNormalizeCommandText(sqlText, "sqlite"); got != sqlText {
+		t.Fatalf("unexpected non-SQL Server rewrite: %q", got)
+	}
+}
+
 func TestADODBConnectionPinsDatabaseSession(t *testing.T) {
 	vm := NewVM(nil, nil, 5)
 	host := NewMockHost()
