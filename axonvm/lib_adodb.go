@@ -398,6 +398,12 @@ func (vm *VM) dispatchADODBConnectionMethod(conn *adodbConnection, member string
 		return Value{Type: VTEmpty}
 	case strings.EqualFold(member, "OpenSchema"):
 		return vm.adodbConnectionOpenSchema(conn, args)
+	case strings.EqualFold(member, "Errors"):
+		// Microsoft JScript permits the ADO default-property shorthand
+		// conn.Errors(index), which is compiled as a member call on Connection.
+		errors := vm.newADODBErrorsCollection(conn)
+		result, _ := vm.dispatchADODBErrorsCollectionMethod(errors.Num, "", args)
+		return result
 	case strings.EqualFold(member, "Cancel"):
 		return Value{Type: VTEmpty}
 	}

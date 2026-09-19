@@ -126,6 +126,26 @@ func TestADODBErrorExposesNativeError(t *testing.T) {
 	}
 }
 
+func TestJScriptADODBErrorsDefaultIndexedPropertyExposesProviderFields(t *testing.T) {
+	vm := NewVM(nil, nil, 5)
+	conn := &adodbConnection{}
+	vm.adodbConnectionPushError(conn, "ADODB.Connection.Execute", -2147467259, "provider failed", "HY000")
+	errValue := vm.dispatchADODBConnectionMethod(conn, "Errors", []Value{NewInteger(0)})
+	if errValue.Type != VTNativeObject {
+		t.Fatalf("default Errors(index) did not return an error object: %#v", errValue)
+	}
+	for member, want := range map[string]string{
+		"NativeError": "-2147467259",
+		"Description": "provider failed",
+		"Source":      "ADODB.Connection.Execute",
+	} {
+		got, propertyHandled := vm.dispatchADODBErrorPropertyGet(errValue.Num, member)
+		if !propertyHandled || got.String() != want {
+			t.Fatalf("unexpected %s: %#v, want %q", member, got, want)
+		}
+	}
+}
+
 func TestADODBNormalizesODBCProcedureCallForSQLServer(t *testing.T) {
 	got := adodbNormalizeCommandText(" { call process_item('A', 2) } ", "mssql")
 	if got != "EXEC process_item 'A', 2" {
