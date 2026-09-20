@@ -7477,6 +7477,11 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 			return Value{Type: VTEmpty}
 		case strings.EqualFold(member, "Count"):
 			return NewInteger(int64(session.Count()))
+		case strings.EqualFold(member, "Key"):
+			if len(args) >= 1 {
+				return vm.sessionContentsKey(args[0])
+			}
+			return NewString("")
 		case strings.EqualFold(member, "Keys"):
 			keys := session.GetAllKeys()
 			sort.Strings(keys)
@@ -7538,6 +7543,11 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 			return Value{Type: VTEmpty}
 		case strings.EqualFold(member, "Count"):
 			return NewInteger(int64(len(application.GetContentsCopy())))
+		case strings.EqualFold(member, "Key"):
+			if len(args) >= 1 {
+				return vm.applicationContentsKey(args[0])
+			}
+			return NewString("")
 		case strings.EqualFold(member, "Keys"):
 			contents := application.GetContentsCopy()
 			keys := make([]string, 0, len(contents))
@@ -7585,13 +7595,7 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		}
 	case nativeObjectSessionContentsKeyMethod:
 		if member == "" && len(args) >= 1 {
-			idx := vm.asInt(args[0]) - 1
-			keys := vm.host.Session().GetAllKeys()
-			sort.Strings(keys)
-			if idx >= 0 && idx < len(keys) {
-				return NewString(keys[idx])
-			}
-			return NewString("")
+			return vm.sessionContentsKey(args[0])
 		}
 		return NewString("")
 	case nativeObjectSessionStaticObjectsKeyMethod:
@@ -7611,17 +7615,7 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		return NewString("")
 	case nativeObjectApplicationContentsKeyMethod:
 		if member == "" && len(args) >= 1 {
-			idx := vm.asInt(args[0]) - 1
-			contents := vm.host.Application().GetContentsCopy()
-			keys := make([]string, 0, len(contents))
-			for k := range contents {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			if idx >= 0 && idx < len(keys) {
-				return NewString(keys[idx])
-			}
-			return NewString("")
+			return vm.applicationContentsKey(args[0])
 		}
 		return NewString("")
 	case nativeObjectApplicationStaticObjectsKeyMethod:
@@ -7653,6 +7647,30 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		}
 	}
 	return Value{Type: VTEmpty}
+}
+
+func (vm *VM) sessionContentsKey(index Value) Value {
+	idx := vm.asInt(index) - 1
+	keys := vm.host.Session().GetAllKeys()
+	sort.Strings(keys)
+	if idx >= 0 && idx < len(keys) {
+		return NewString(keys[idx])
+	}
+	return NewString("")
+}
+
+func (vm *VM) applicationContentsKey(index Value) Value {
+	idx := vm.asInt(index) - 1
+	contents := vm.host.Application().GetContentsCopy()
+	keys := make([]string, 0, len(contents))
+	for key := range contents {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	if idx >= 0 && idx < len(keys) {
+		return NewString(keys[idx])
+	}
+	return NewString("")
 }
 
 // dispatchMemberGet resolves chained member access on native objects.

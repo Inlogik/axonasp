@@ -270,6 +270,40 @@ connection.Close();
 	}
 }
 
+func TestJScriptSessionContentsRemovalWhileIteratingDescending(t *testing.T) {
+	source := `<%@ Language="JScript" %><%
+Session("item-alpha") = "first";
+Session("item-beta") = "second";
+Session("item-gamma") = "third";
+for (var i = Session.Contents.Count; i > 0; i--) {
+    var key = String(Session.Contents.Key(i));
+    Session.Contents.Remove(key);
+}
+Response.Write(Session.Contents.Count + "|" + typeof Session("item-alpha"));
+%>`
+
+	if got := runASPSourceForTest(t, source); got != "0|undefined" {
+		t.Fatalf("unexpected JScript Session.Contents removal output: %q", got)
+	}
+}
+
+func TestJScriptApplicationContentsRemovalWhileIteratingDescending(t *testing.T) {
+	source := `<%@ Language="JScript" %><%
+Application("item-alpha") = "first";
+Application("item-beta") = "second";
+Application("item-gamma") = 15;
+for (var i = Application.Contents.Count; i > 0; i--) {
+    var key = String(Application.Contents.Key(i));
+    Application.Contents.Remove(key);
+}
+Response.Write(Application.Contents.Count + "|" + typeof Application("item-alpha"));
+%>`
+
+	if got := runASPSourceForTest(t, source); got != "0|undefined" {
+		t.Fatalf("unexpected JScript Application.Contents removal output: %q", got)
+	}
+}
+
 func TestADODBMaterializedRecordsetReleasesPinnedConnection(t *testing.T) {
 	vm := NewVM(nil, nil, 5)
 	vm.SetHost(NewMockHost())
