@@ -939,12 +939,10 @@ func (vm *VM) dispatchADODBRecordsetMethod(rs *adodbRecordset, member string, ar
 	case member == "":
 		if len(args) > 0 {
 			if vm.adodbRecordsetIsLiveOLE(rs) {
-				key := vm.adodbRecordsetResolveColumnKey(rs, args[0])
-				if idx, exists := rs.columnIndexByLower[key]; exists && idx >= 0 && idx < len(rs.columns) {
-					key = rs.columns[idx]
-				}
-				if key != "" {
+				selector := vm.adodbOLEFieldSelector(args[0])
+				if selector != "" {
 					if len(args) > 1 {
+						key := vm.adodbRecordsetResolveColumnKey(rs, args[0])
 						if vm.adodbOLESetFieldValue(rs, key, args[len(args)-1]) {
 							if rs.editMode != adEditAdd {
 								rs.editMode = adEditInProgress
@@ -953,7 +951,7 @@ func (vm *VM) dispatchADODBRecordsetMethod(rs *adodbRecordset, member string, ar
 						}
 						return Value{Type: VTEmpty}
 					}
-					if v, ok := vm.adodbOLEGetFieldValue(rs, key); ok {
+					if v, ok := vm.adodbOLEGetFieldValueBySelector(rs, selector); ok {
 						return v
 					}
 				}
@@ -964,9 +962,7 @@ func (vm *VM) dispatchADODBRecordsetMethod(rs *adodbRecordset, member string, ar
 					if (args[0].Type == VTInteger || args[0].Type == VTDouble) && len(args) == 1 {
 						idx := vm.asInt(args[0])
 						if idx >= 0 && idx < len(rs.columns) {
-							if val, ok := row[strings.ToLower(strings.TrimSpace(rs.columns[idx]))]; ok {
-								return val
-							}
+							return vm.adodbRecordsetValueByOrdinal(rs, row, idx)
 						}
 					}
 					key := vm.adodbRecordsetResolveColumnKey(rs, args[0])
@@ -1417,6 +1413,26 @@ func (vm *VM) adodbRecordsetRebuildColumnIndex(rs *adodbRecordset) {
 			rs.columnIndexByLower[key] = idx
 		}
 	}
+}
+
+// adodbOLEFieldSelector preserves numeric selectors for the COM Fields.Item
+// default property while normalizing named selectors to strings.
+func (vm *VM) adodbOLEFieldSelector(selector Value) any {
+	if selector.Type == VTInteger || selector.Type == VTDouble {
+		return vm.asInt(selector)
+	}
+	return selector.String()
+}
+
+// adodbRecordsetValueByOrdinal returns one materialized field by its ordinal.
+func (vm *VM) adodbRecordsetValueByOrdinal(rs *adodbRecordset, row map[string]Value, index int) Value {
+	if rs == nil || row == nil || index < 0 || index >= len(rs.columns) {
+		return Value{Type: VTEmpty}
+	}
+	if value, ok := row[strings.ToLower(strings.TrimSpace(rs.columns[index]))]; ok {
+		return value
+	}
+	return Value{Type: VTEmpty}
 }
 
 // adodbRecordsetClearPendingUpdateFields resets tracked changed columns for one recordset edit cycle.
@@ -2922,6 +2938,11 @@ func (vm *VM) adodbOLERefreshPositionFlags(rs *adodbRecordset) {
 
 // adodbOLEGetFieldValue fetches one field value from the current row of a live OLE cursor.
 func (vm *VM) adodbOLEGetFieldValue(rs *adodbRecordset, fieldName string) (Value, bool) {
+	return vm.adodbOLEGetFieldValueBySelector(rs, fieldName)
+}
+
+// adodbOLEGetFieldValueBySelector fetches a field by either its name or ordinal.
+func (vm *VM) adodbOLEGetFieldValueBySelector(rs *adodbRecordset, selector any) (Value, bool) {
 	if rs == nil || rs.oleRecordset == nil {
 		return Value{Type: VTEmpty}, false
 	}
@@ -2939,7 +2960,7 @@ func (vm *VM) adodbOLEGetFieldValue(rs *adodbRecordset, fieldName string) (Value
 	}
 	defer fields.Release()
 
-	itemRes, _ := oleutil.GetProperty(fields, "Item", fieldName)
+	itemRes, _ := oleutil.GetProperty(fields, "Item", selector)
 	if itemRes == nil {
 		return Value{Type: VTEmpty}, false
 	}

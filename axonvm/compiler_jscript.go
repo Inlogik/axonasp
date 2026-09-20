@@ -2284,6 +2284,13 @@ func (c *Compiler) compileJScriptExpression(expr jsast.Expression) {
 		c.patchJSJump(jumpFalse)
 		c.compileJScriptExpression(node.Alternate)
 		c.patchJSJump(jumpEnd)
+	case *jsast.SequenceExpression:
+		for index, expression := range node.Sequence {
+			c.compileJScriptExpression(expression)
+			if index < len(node.Sequence)-1 {
+				c.emit(OpJSPop)
+			}
+		}
 	case *jsast.AwaitExpression:
 		if node.Argument != nil {
 			c.compileJScriptExpression(node.Argument)

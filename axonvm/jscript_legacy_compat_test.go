@@ -208,6 +208,68 @@ func TestADODBRecordsetDefaultPropertyReadsUnnamedColumnByOrdinal(t *testing.T) 
 	}
 }
 
+func TestADODBLiveRecordsetDefaultPropertyPreservesOrdinalSelector(t *testing.T) {
+	vm := NewVM(nil, nil, 5)
+	if selector := vm.adodbOLEFieldSelector(NewInteger(1)); selector != 1 {
+		t.Fatalf("expected numeric ADODB selector 1, got %#v", selector)
+	}
+	if selector := vm.adodbOLEFieldSelector(NewString("field_b")); selector != "field_b" {
+		t.Fatalf("expected named ADODB selector, got %#v", selector)
+	}
+}
+
+func TestADODBMaterializedRecordsetReadsEveryFieldByOrdinal(t *testing.T) {
+	vm := NewVM(nil, nil, 5)
+	rs := &adodbRecordset{columns: []string{"field_a", "field_b", "field_c", "field_d"}}
+	row := map[string]Value{
+		"field_a": NewInteger(7),
+		"field_b": NewString("value-b"),
+		"field_c": NewString("value-c"),
+		"field_d": NewString("value-d"),
+	}
+
+	want := []string{"7", "value-b", "value-c", "value-d"}
+	for index, expected := range want {
+		if got := vm.adodbRecordsetValueByOrdinal(rs, row, index).String(); got != expected {
+			t.Fatalf("field %d = %q, want %q", index, got, expected)
+		}
+	}
+}
+
+func TestJScriptADODBRecordsetDefaultPropertyReadsFieldsByOrdinalAndName(t *testing.T) {
+	source := `<%@ Language="JScript" %><%
+var connection = Server.CreateObject("ADODB.Connection");
+connection.Open("sqlite::memory:");
+connection.Execute("CREATE TABLE sample_values (field_a INTEGER, field_b TEXT)");
+connection.Execute("INSERT INTO sample_values VALUES (7, 'value-b')");
+var rs = connection.Execute("SELECT field_a, field_b FROM sample_values");
+Response.Write(String(rs(0)) + "|" + String(rs(1)) + "|" + String(rs("field_b")));
+connection.Close();
+%>`
+
+	if got := runASPSourceForTest(t, source); got != "7|value-b|value-b" {
+		t.Fatalf("unexpected JScript Recordset field output: %q", got)
+	}
+}
+
+func TestJScriptSequenceAssignmentsRetainEachRecordsetFieldValue(t *testing.T) {
+	source := `<%@ Language="JScript" %><%
+var connection = Server.CreateObject("ADODB.Connection");
+connection.Open("sqlite::memory:");
+connection.Execute("CREATE TABLE sample_values (field_a INTEGER, field_b TEXT, field_c TEXT, field_d TEXT)");
+connection.Execute("INSERT INTO sample_values VALUES (7, 'value-b', 'value-c', 'value-d')");
+var rs = connection.Execute("SELECT field_a, field_b, field_c, field_d FROM sample_values");
+var rs0, rs1, rs2, rs3;
+rs0=String(rs(0)), rs1=String(rs(1)), rs2=String(rs(2)), rs3=String(rs(3));
+Response.Write(rs0 + "|" + rs1 + "|" + rs2 + "|" + rs3);
+connection.Close();
+%>`
+
+	if got := runASPSourceForTest(t, source); got != "7|value-b|value-c|value-d" {
+		t.Fatalf("unexpected JScript sequence assignment output: %q", got)
+	}
+}
+
 func TestADODBMaterializedRecordsetReleasesPinnedConnection(t *testing.T) {
 	vm := NewVM(nil, nil, 5)
 	vm.SetHost(NewMockHost())
