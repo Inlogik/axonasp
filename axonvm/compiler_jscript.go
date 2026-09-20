@@ -567,6 +567,9 @@ func (c *Compiler) compileJScriptStatement(stmt jsast.Statement) {
 	}
 	switch node := stmt.(type) {
 	case *jsast.ExpressionStatement:
+		if c.compileJScriptResponseWriteStatement(node.Expression) {
+			return
+		}
 		c.compileJScriptExpression(node.Expression)
 		c.emit(OpJSPop)
 	case *jsast.VariableStatement:
@@ -777,6 +780,38 @@ func (c *Compiler) compileJScriptStatement(stmt jsast.Statement) {
 	case *jsast.SwitchStatement:
 		c.compileJScriptSwitchStatement(node)
 	}
+}
+
+// compileJScriptResponseWriteStatement emits direct output opcodes for an
+// unshadowed Response.Write(value) expression statement. Classic ASP templates
+// generate this shape for both literal HTML and <%= expression %> blocks.
+// Keeping the optimization at statement level preserves the empty return value
+// semantics of Response.Write when it is used as part of a larger expression.
+func (c *Compiler) compileJScriptResponseWriteStatement(expr jsast.Expression) bool {
+	call, ok := expr.(*jsast.CallExpression)
+	if !ok || len(call.ArgumentList) != 1 {
+		return false
+	}
+	dot, ok := call.Callee.(*jsast.DotExpression)
+	if !ok || !strings.EqualFold(dot.Identifier.Name.String(), "Write") {
+		return false
+	}
+	target, ok := dot.Left.(*jsast.Identifier)
+	if !ok || !strings.EqualFold(target.Name.String(), "Response") {
+		return false
+	}
+	if _, shadowed := c.jsResolveLocalSlot(target.Name.String()); shadowed {
+		return false
+	}
+
+	if literal, ok := call.ArgumentList[0].(*jsast.StringLiteral); ok {
+		c.emit(OpWriteStatic, c.addConstant(NewString(literal.Value.String())))
+		return true
+	}
+
+	c.compileJScriptExpression(call.ArgumentList[0])
+	c.emitExt(ExtOpJSWrite)
+	return true
 }
 
 type jsUsingBinding struct {

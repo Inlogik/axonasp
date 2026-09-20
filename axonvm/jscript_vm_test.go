@@ -197,15 +197,15 @@ func TestJScriptResponseWriteFromScriptTag(t *testing.T) {
 	if err := compiler.Compile(); err != nil {
 		t.Fatalf("compile failed: %v", err)
 	}
-	containsJSOpcode := false
+	containsWriteOpcode := false
 	for i := 0; i < len(compiler.Bytecode()); i++ {
-		if OpCode(compiler.Bytecode()[i]) == OpJSCallMember {
-			containsJSOpcode = true
+		if OpCode(compiler.Bytecode()[i]) == OpWriteStatic {
+			containsWriteOpcode = true
 			break
 		}
 	}
-	if !containsJSOpcode {
-		t.Fatalf("expected OpJSCallMember in bytecode, got %v", compiler.Bytecode())
+	if !containsWriteOpcode {
+		t.Fatalf("expected direct OpWriteStatic in bytecode, got %v", compiler.Bytecode())
 	}
 	vm := NewVM(compiler.Bytecode(), compiler.Constants(), compiler.GlobalsCount())
 	if vm.Globals[0].Type != VTNativeObject {

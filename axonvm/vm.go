@@ -1174,7 +1174,7 @@ func opcodeOperandSize(op OpCode, bytecode []byte, ip int) int {
 			return 9
 		case ExtOpFilePrint, ExtOpFileWrite:
 			return 3
-		case ExtOpFileOpen, ExtOpFileClose, ExtOpFileLineInput, ExtOpFilePut, ExtOpFileGet, ExtOpFileFreeFile, ExtOpAxonASP, ExtOpJSReThrow, ExtOpCloneRecord, ExtOpShiftLeft, ExtOpShiftRight:
+		case ExtOpFileOpen, ExtOpFileClose, ExtOpFileLineInput, ExtOpFilePut, ExtOpFileGet, ExtOpFileFreeFile, ExtOpAxonASP, ExtOpJSReThrow, ExtOpCloneRecord, ExtOpShiftLeft, ExtOpShiftRight, ExtOpJSWrite:
 			return 1
 		case ExtOpJSMathSin, ExtOpJSMathCos, ExtOpJSMathTan, ExtOpJSMathAbs, ExtOpJSMathFloor, ExtOpJSMathCeil, ExtOpJSMathRound, ExtOpJSMathSqrt, ExtOpJSMathMin, ExtOpJSMathMax, ExtOpJSMathPow:
 			return 1
@@ -1249,7 +1249,7 @@ func remapExecuteGlobalBytecode(bytecode []byte, constBase int, bytecodeBase int
 				ip += 2
 			case ExtOpAxonASP, ExtOpJSMathSin, ExtOpJSMathCos, ExtOpJSMathTan, ExtOpJSMathAbs, ExtOpJSMathFloor, ExtOpJSMathCeil, ExtOpJSMathRound, ExtOpJSMathSqrt, ExtOpJSMathMin, ExtOpJSMathMax, ExtOpJSMathPow,
 				ExtOpFileOpen, ExtOpFileClose, ExtOpFileLineInput, ExtOpFilePut, ExtOpFileGet, ExtOpFileFreeFile,
-				ExtOpJSReThrow, ExtOpCloneRecord, ExtOpShiftLeft, ExtOpShiftRight:
+				ExtOpJSReThrow, ExtOpCloneRecord, ExtOpShiftLeft, ExtOpShiftRight, ExtOpJSWrite:
 				// No operands to remap or skip
 			case ExtOpFilePrint, ExtOpFileWrite:
 				ip += 2
@@ -3975,6 +3975,12 @@ aspExecLoop:
 					vm.push(NewInteger(0))
 				} else {
 					vm.push(NewInteger(int64(val >> shift)))
+				}
+
+			case ExtOpJSWrite:
+				value := vm.pop()
+				if vm.output != nil {
+					_, _ = io.WriteString(vm.output, vm.valueToResponseString(value))
 				}
 
 			default:
