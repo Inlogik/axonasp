@@ -128,15 +128,6 @@ func getProgramPool(program CachedProgram) *vmProgramPool {
 		program:     immutableCachedProgramView(program),
 	}
 
-	// Pre-warming: Fill the pool with a few pre-allocated VMs to handle initial bursts.
-	// We don't fill the entire limit (250) to avoid excessive memory usage in tests/rare scripts.
-	warmLimit := min(limit, 5)
-	for range warmLimit {
-		vm := NewVMFromCachedProgram(entry.program)
-		vm.pooledFrom = entry
-		entry.items = append(entry.items, vm)
-	}
-
 	actual, _ := cachedProgramPools.LoadOrStore(key, entry)
 	return actual.(*vmProgramPool)
 }
@@ -795,10 +786,10 @@ func (vm *VM) ensureDynamicMaps() {
 		vm.jsFunctionItems = make(map[int64]*jsFunctionObject)
 	}
 	if vm.jsForInItems == nil {
-		vm.jsForInItems = make(map[int]*jsForInEnumerator)
+		vm.jsForInItems = make(map[jsLoopEnumeratorKey]*jsForInEnumerator)
 	}
 	if vm.jsForOfItems == nil {
-		vm.jsForOfItems = make(map[int]*jsForOfEnumerator)
+		vm.jsForOfItems = make(map[jsLoopEnumeratorKey]*jsForOfEnumerator)
 	}
 	if vm.jsEnvItems == nil {
 		vm.jsEnvItems = make(map[int64]*jsEnvFrame)

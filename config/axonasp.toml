@@ -125,6 +125,11 @@ default_error_pages_directory = "./www/error-pages"
 # The root directory for the web server. This is the base directory from which the server will serve files. When a client makes a request, the server will look for the requested file within this directory. For example, if the web_root is set to "./www" and a client requests "/index.html", the server will look for "./www/index.html". Make sure to set this to the correct path where your ASP applications and static files are located. This configuration can't be be overridden by settings in the web.config file of your ASP application.
 web_root = "./www/"
 
+# Allow Scripting.FileSystemObject to access absolute filesystem paths outside
+# web_root. Keep this disabled unless a trusted legacy application explicitly
+# requires access to configured document/export directories.
+allow_external_filesystem_access = false
+
 # List of default pages to try when a directory is accessed. The server will 
 # look for these files in order and serve the first one it finds.
 default_pages = [

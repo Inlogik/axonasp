@@ -86,6 +86,7 @@ func NewWebHost(w http.ResponseWriter, r *http.Request) *WebHost {
 	host.response.SetMaxBufferBytes(ResponseBufferLimitBytes)
 	host.request.SetHTTPRequest(r)
 	host.server.SetRootDir(RootDir)
+	host.server.SetUnrestrictedFS(AllowExternalFilesystemAccess)
 	host.server.SetRequestPath(r.URL.Path)
 	_ = host.server.SetScriptTimeout(ScriptTimeout)
 
@@ -143,6 +144,11 @@ func NewWebHost(w http.ResponseWriter, r *http.Request) *WebHost {
 	host.request.ServerVars.Add("PATH_INFO", r.URL.Path)
 	host.request.ServerVars.Add("PATH_TRANSLATED", host.server.MapPath(r.URL.Path))
 	host.request.ServerVars.Add("APPL_PHYSICAL_PATH", host.server.MapPath("/"))
+	// Classic ASP applications derive their virtual application name from IIS
+	// metadata.  Supplying the equivalent root values prevents getAppPath()
+	// from producing "//" cookie paths (which browsers may reject).
+	host.request.ServerVars.Add("APPL_MD_PATH", "/LM/W3SVC/1/ROOT")
+	host.request.ServerVars.Add("INSTANCE_META_PATH", "/LM/W3SVC/1/ROOT")
 	host.request.ServerVars.Add("REMOTE_ADDR", requestRemoteAddr(r.RemoteAddr))
 	host.request.ServerVars.Add("REQUEST_METHOD", r.Method)
 	host.request.ServerVars.Add("SERVER_NAME", hostName)

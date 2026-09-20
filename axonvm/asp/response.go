@@ -82,7 +82,7 @@ type Response struct {
 	pics          string
 	status        string
 
-	headers     map[string]string
+	headers     http.Header
 	cookies     map[string]*ResponseCookie
 	cookieOrder []string
 	logEntries  []string
@@ -118,7 +118,7 @@ func NewResponse(output io.Writer) *Response {
 		charset:        "utf-8",
 		contentType:    "text/html",
 		status:         "200 OK",
-		headers:        make(map[string]string),
+		headers:        make(http.Header),
 		cookies:        make(map[string]*ResponseCookie),
 		cookieOrder:    make([]string, 0),
 		logEntries:     make([]string, 0),
@@ -249,7 +249,9 @@ func (r *Response) BinaryWrite(data []byte) {
 	}
 }
 
-// AddHeader sets an HTTP header if output was not flushed yet.
+// AddHeader adds an HTTP header if output was not flushed yet. Classic ASP
+// permits repeated Set-Cookie values, but a later value for the same cookie
+// name replaces the earlier pending value.
 func (r *Response) AddHeader(name string, value string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -257,7 +259,61 @@ func (r *Response) AddHeader(name string, value string) {
 	if r.flushed || r.ended {
 		return
 	}
-	r.headers[name] = value
+	if strings.EqualFold(name, "Set-Cookie") {
+		value = normalizeSetCookiePath(value)
+		replaceSetCookieHeader(r.headers, value)
+		return
+	}
+	r.headers.Add(name, value)
+}
+
+func replaceSetCookieHeader(headers http.Header, value string) {
+	name := setCookieName(value)
+	if name == "" {
+		headers.Add("Set-Cookie", value)
+		return
+	}
+
+	existing := headers.Values("Set-Cookie")
+	headers.Del("Set-Cookie")
+	for _, current := range existing {
+		if !strings.EqualFold(setCookieName(current), name) {
+			headers.Add("Set-Cookie", current)
+		}
+	}
+	headers.Add("Set-Cookie", value)
+}
+
+func setCookieName(value string) string {
+	pair := value
+	if separator := strings.IndexByte(pair, ';'); separator >= 0 {
+		pair = pair[:separator]
+	}
+	equals := strings.IndexByte(pair, '=')
+	if equals <= 0 {
+		return ""
+	}
+	return strings.TrimSpace(pair[:equals])
+}
+
+// normalizeSetCookiePath prevents legacy apps that concatenate a customer
+// prefix and application path from issuing Path=//. RFC 6265 requires a
+// single leading slash; normalizing here makes the cookie usable by browsers
+// without changing application code.
+func normalizeSetCookiePath(value string) string {
+	parts := strings.Split(value, ";")
+	for i := range parts {
+		trimmed := strings.TrimSpace(parts[i])
+		if len(trimmed) < len("path=") || !strings.EqualFold(trimmed[:len("path=")], "path=") {
+			continue
+		}
+		path := strings.TrimSpace(trimmed[len("path="):])
+		if strings.HasPrefix(path, "//") {
+			path = "/" + strings.TrimLeft(path, "/")
+			parts[i] = " path=" + path
+		}
+	}
+	return strings.Join(parts, ";")
 }
 
 // AppendToLog appends one message into response internal log entries and runtime log output.
@@ -333,7 +389,7 @@ func (r *Response) Redirect(location string) {
 	if r.buffer != nil {
 		r.buffer.Reset()
 	}
-	r.headers["Location"] = location
+	r.headers.Set("Location", location)
 	r.status = "302 Found"
 	r.flushInternal()
 	r.ended = true
@@ -688,8 +744,10 @@ func (r *Response) flushInternal() {
 		if r.pics != "" {
 			r.w.Header().Set("PICS-Label", r.pics)
 		}
-		for name, value := range r.headers {
-			r.w.Header().Set(name, value)
+		for name, values := range r.headers {
+			for _, value := range values {
+				r.w.Header().Add(name, value)
+			}
 		}
 
 		contentType := r.contentType

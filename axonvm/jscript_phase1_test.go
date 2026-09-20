@@ -23,6 +23,7 @@ package axonvm
 import (
 	"bytes"
 	"math"
+	"strings"
 	"testing"
 
 	"g3pix.com.br/axonasp/v2/axonvm/asp"
@@ -392,6 +393,76 @@ func TestJScriptStringTypeConversion(t *testing.T) {
 	}
 }
 
+// TestJScriptResponseWriteNaN verifies the legacy Microsoft JScript host
+// representation used when Response.Write implicitly converts NaN.
+func TestJScriptResponseWriteNaN(t *testing.T) {
+	out, err := runJScript2(t, jscriptSrc(`
+		Response.Write("direct=["); Response.Write(NaN); Response.Write("]|");
+		Response.Write("concat=[" + NaN + "]|");
+		Response.Write("string=[" + String(NaN) + "]|");
+		Response.Write("unary=["); Response.Write(+Request("missing")); Response.Write("]|");
+		Response.Write("unary-concat=[" + (+Request("missing")) + "]");
+	`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "direct=[-1.#IND]|concat=[NaN]|string=[NaN]|unary=[-1.#IND]|unary-concat=[NaN]"
+	if out != want {
+		t.Errorf("expected legacy NaN response rendering %q, got %q", want, out)
+	}
+}
+
+func TestMicrosoftJScriptResponseDoubleFormatting(t *testing.T) {
+	tests := []struct {
+		value float64
+		want  string
+	}{
+		{math.NaN(), "-1.#IND"},
+		{math.Inf(1), "1.#INF"},
+		{math.Inf(-1), "-1.#INF"},
+		{math.Copysign(0, -1), "0"},
+		{3.14, "3.14"},
+		{0.0000001, "0.0000001"},
+		{0.000000000000001, "0.000000000000001"},
+		{1.2345678901234567, "1.23456789012346"},
+		{999999999999999, "999999999999999"},
+		{1000000000000000, "1E+15"},
+		{10000000000000000, "1E+16"},
+		{-1000000000000000, "-1E+15"},
+	}
+	for _, test := range tests {
+		if got := formatMicrosoftJScriptResponseDouble(test.value); got != test.want {
+			t.Errorf("formatMicrosoftJScriptResponseDouble(%v) = %q, want %q", test.value, got, test.want)
+		}
+	}
+}
+
+func TestMicrosoftJScriptResponseLargeIntegerFormatting(t *testing.T) {
+	out, err := runJScript2(t, jscriptSrc(`
+		Response.Write(999999999999999); Response.Write("|");
+		Response.Write(1000000000000000); Response.Write("|");
+		Response.Write(9999999999999999); Response.Write("|");
+		Response.Write(10000000000000000);
+	`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "999999999999999|1E+15|1E+16|1E+16"
+	if out != want {
+		t.Errorf("expected legacy large integer rendering %q, got %q", want, out)
+	}
+}
+
+func TestJScriptUnresolvedIdentifierThrowsRuntimeError(t *testing.T) {
+	_, err := runJScript2(t, jscriptSrc(`Response.Write(notDeclared);`))
+	if err == nil {
+		t.Fatal("expected unresolved identifier to throw")
+	}
+	if !strings.Contains(err.Error(), "notDeclared is undefined") {
+		t.Fatalf("unexpected unresolved identifier error: %v", err)
+	}
+}
+
 // TestJScriptStringTypeConversionNoArgs verifies String() with zero arguments
 // returns empty string (ES5 behavior), not VBScript String() which would
 // also return empty but for different reasons.
@@ -694,7 +765,8 @@ func TestJScriptMathLog0(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := "-Infinity"
+	// Microsoft JScript formats negative infinity using its legacy token.
+	expected := "-1.#INF"
 	if out != expected {
 		t.Errorf("expected %q, got %q", expected, out)
 	}
@@ -1061,5 +1133,25 @@ func TestValueToStringEmptyRequestCollection(t *testing.T) {
 	jsResult := vm.jsToString(nativeVal)
 	if jsResult != "" {
 		t.Errorf("jsToString(empty RequestCollectionValue) = %q, want %q", jsResult, "")
+	}
+}
+
+func TestJScriptNumberCoercionOfRequestCollectionValue(t *testing.T) {
+	vm := NewVM([]byte{}, nil, 0)
+	host := NewMockHost()
+	vm.SetHost(host)
+
+	emptyID := vm.nextDynamicNativeID
+	vm.nextDynamicNativeID++
+	vm.requestCollectionValueItems[emptyID] = asp.RequestCollectionValue{}
+	if got := vm.jsToNumber(Value{Type: VTNativeObject, Num: emptyID}); got.Type != VTDouble || !math.IsNaN(got.Flt) {
+		t.Fatalf("missing Request value should convert to NaN, got %#v", got)
+	}
+
+	valueID := vm.nextDynamicNativeID
+	vm.nextDynamicNativeID++
+	vm.requestCollectionValueItems[valueID] = asp.RequestCollectionValue{Values: []string{"250"}}
+	if got := vm.jsToNumber(Value{Type: VTNativeObject, Num: valueID}); got.Type != VTDouble || got.Flt != 250 {
+		t.Fatalf("numeric Request value should convert to 250, got %#v", got)
 	}
 }

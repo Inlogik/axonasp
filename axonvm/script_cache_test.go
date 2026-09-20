@@ -213,6 +213,39 @@ func TestScriptCacheDiskInvalidatesChangedInclude(t *testing.T) {
 	}
 }
 
+func TestScriptCacheDiskHitWithIncludeSiteRoot(t *testing.T) {
+	cacheDir := t.TempDir()
+	cache := NewScriptCache(BytecodeCacheDiskOnly, cacheDir, 8)
+	sourcePath := filepath.Join(cacheDir, "default.asp")
+	if err := os.WriteFile(sourcePath, []byte("<% Response.Write 1 %>"), 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	sourceInfo, err := os.Stat(sourcePath)
+	if err != nil {
+		t.Fatalf("stat source: %v", err)
+	}
+	program := CachedProgram{
+		Bytecode:        []byte{1, 2, 3},
+		GlobalCount:     1,
+		SourceName:      sourcePath,
+		IncludeSiteRoot: cacheDir,
+	}
+	if err := cache.storeDiskProgram(sourcePath, sourceInfo.ModTime(), program); err != nil {
+		t.Fatalf("store disk program: %v", err)
+	}
+	previousHook := scriptCacheProcessBinaryModUnix
+	defer func() { scriptCacheProcessBinaryModUnix = previousHook }()
+	scriptCacheProcessBinaryModUnix = func() int64 { return 0 }
+
+	loaded, found := cache.loadDiskProgram(sourcePath, sourceInfo)
+	if !found {
+		t.Fatal("expected disk cache hit with IncludeSiteRoot")
+	}
+	if !includeSiteRootMatches(loaded, ScriptCompileOptions{IncludeSiteRoot: cacheDir}) {
+		t.Fatalf("loaded IncludeSiteRoot = %q, want %q", loaded.IncludeSiteRoot, cacheDir)
+	}
+}
+
 // TestScriptCacheDiskMissesWhenIncludeMetadataMissing verifies stale cache payloads
 // without include dependency metadata are not reused for pages with include directives.
 func TestScriptCacheDiskMissesWhenIncludeMetadataMissing(t *testing.T) {

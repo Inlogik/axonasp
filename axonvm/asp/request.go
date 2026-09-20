@@ -247,6 +247,33 @@ func (c *RequestCollection) GetValue(key string) (RequestCollectionValue, bool) 
 	return RequestCollectionValue{Values: lazyValues}, true
 }
 
+// GetSelectedValue resolves either a key name or an ASP-compatible 1-based
+// numeric index and preserves the entry's individual values.
+func (c *RequestCollection) GetSelectedValue(selector string) (RequestCollectionValue, bool) {
+	c.notifyAccess()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.ensureLazyParsedLocked()
+	key := selector
+	if index, ok := parsePositiveInt(selector); ok {
+		key = c.keyByIndexLocked(index)
+		if key == "" {
+			return RequestCollectionValue{}, false
+		}
+	}
+
+	if value, exists := c.data[strings.ToLower(key)]; exists {
+		return value, true
+	}
+	lazyValues := c.lazyValuesForKeyLocked(key)
+	if len(lazyValues) == 0 {
+		return RequestCollectionValue{}, false
+	}
+	return RequestCollectionValue{Values: lazyValues}, true
+}
+
 // Exists reports whether a key exists in the collection.
 func (c *RequestCollection) Exists(key string) bool {
 	c.notifyAccess()
@@ -551,20 +578,20 @@ func (r *Request) HTTPRequest() *http.Request {
 
 // GetValue retrieves a value from Request collections using ASP default lookup order.
 func (r *Request) GetValue(key string) string {
-	if value := r.QueryString.Get(key); value != "" {
-		return value
+	if value, ok := r.QueryString.GetValue(key); ok {
+		return value.Joined()
 	}
-	if value := r.Form.Get(key); value != "" {
-		return value
+	if value, ok := r.Form.GetValue(key); ok {
+		return value.Joined()
 	}
-	if value := r.Cookies.Get(key); value != "" {
-		return value
+	if value, ok := r.Cookies.GetValue(key); ok {
+		return value.Joined()
 	}
-	if value := r.ClientCertificate.Get(key); value != "" {
-		return value
+	if value, ok := r.ClientCertificate.GetValue(key); ok {
+		return value.Joined()
 	}
-	if value := r.ServerVars.Get(key); value != "" {
-		return value
+	if value, ok := r.ServerVars.GetValue(key); ok {
+		return value.Joined()
 	}
 	return ""
 }

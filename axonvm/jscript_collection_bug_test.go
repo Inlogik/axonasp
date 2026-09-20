@@ -90,20 +90,39 @@ func TestJScriptCollectionCompatibility(t *testing.T) {
 	}
 }
 
+func TestJScriptRequestCollectionKeyMethod(t *testing.T) {
+	host := NewMockHost()
+	host.Request().QueryString.Add("mode", "brief")
+	host.Request().QueryString.Add("start", "2026-06-17")
+
+	source := `<%@ Language="JScript" %><%
+Response.Write(Request.QueryString.Count + ":" + Request.QueryString.Key(1) + ":" + String(Request.QueryString("mode")) + ":" + String(Request.QueryString(Request.QueryString.Key(1))) + "|");
+var input = {};
+for (var i = 1; i <= Request.QueryString.Count; i++) {
+	input[Request.QueryString.Key(i)] = String(Request.QueryString(i));
+}
+Response.Write(input.mode + "|" + input.start + "|" + JSON.stringify(input));
+%>`
+
+	if got := runASPSourceForTestWithHost(t, source, host); got != `2:mode:brief:brief|brief|2026-06-17|{"mode":"brief","start":"2026-06-17"}` {
+		t.Fatalf("unexpected request collection key output: %q", got)
+	}
+}
+
 func TestNormalizeJScriptCollectionAssignmentsRegexEscapedQuotes(t *testing.T) {
 	input := `
 function escapeAttr(s) {
   return (s + '').replace(/\\/g, "\\\\").replace(/\'/g, "&#39;").replace(/\"/g, "&quot;");
 }
 var sItems = escapeAttr("hello 'world'");
-Response.Cookies("SelectedItem") = sItems;
+Response.Cookies("ExampleChoice") = sItems;
 `
 	expected := `
 function escapeAttr(s) {
   return (s + '').replace(/\\/g, "\\\\").replace(/\'/g, "&#39;").replace(/\"/g, "&quot;");
 }
 var sItems = escapeAttr("hello 'world'");
-Response.Cookies("SelectedItem", sItems);
+Response.Cookies("ExampleChoice", sItems);
 `
 	got := normalizeJScriptCollectionAssignments(input)
 	if got != expected {
@@ -120,7 +139,7 @@ function escapeAttr(s) {
 
 var sItems = escapeAttr("hello 'world'");
 
-Response.Cookies("SelectedItem") = sItems;
+Response.Cookies("ExampleChoice") = sItems;
 Response.Write("done");
 %>`
 

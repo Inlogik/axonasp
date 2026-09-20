@@ -81,6 +81,34 @@ func TestFSOGetTempNameFormat(t *testing.T) {
 	}
 }
 
+func TestFSOFileExistsAcceptsWindowsSeparatorsOnEveryHost(t *testing.T) {
+	vm := NewVM(nil, nil, 5)
+	host := NewMockHost()
+	rootDir := t.TempDir()
+	host.Server().SetRootDir(rootDir)
+	host.Server().SetRequestPath("/tests/test_server.asp")
+	vm.SetHost(host)
+
+	filePath := filepath.Join(rootDir, "images", "favicon.ico")
+	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+		t.Fatalf("create image directory: %v", err)
+	}
+	if err := os.WriteFile(filePath, []byte("icon"), 0644); err != nil {
+		t.Fatalf("create image file: %v", err)
+	}
+
+	fso := vm.dispatchNativeCall(nativeObjectServer, "CreateObject", []Value{NewString("Scripting.FileSystemObject")})
+	if fso.Type != VTNativeObject {
+		t.Fatalf("expected VTNativeObject for FSO, got %#v", fso)
+	}
+
+	windowsStylePath := host.Server().MapPath("/images") + "\\favicon.ico"
+	exists := vm.dispatchNativeCall(fso.Num, "FileExists", []Value{NewString(windowsStylePath)})
+	if exists.Type != VTBool || exists.Num != 1 {
+		t.Fatalf("expected FileExists True for %q, got %#v", windowsStylePath, exists)
+	}
+}
+
 func TestFSOGetSpecialFolderFolderObject(t *testing.T) {
 	vbsSource := `<%@ Language="VBScript" %>` +
 		`<%` +

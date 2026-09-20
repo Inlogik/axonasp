@@ -191,7 +191,10 @@ func (g *GlobalASA) executeHandler(host ASPHostEnvironment, handlerIdx int, hand
 	//    Application_OnStart / Session_OnStart / etc. defined in JScript are silently
 	//    skipped, breaking IIS compatibility.
 	if handlerName != "" {
-		jsHandler := vm.jsGetName(handlerName)
+		jsHandler, found := vm.jsGetDeclaredName(handlerName)
+		if !found {
+			return nil
+		}
 		if jsHandler.Type == VTJSFunction {
 			if vm.jsBeginDirectCall(jsHandler, Value{Type: VTJSUndefined}, nil) {
 				return vm.Run()
@@ -203,6 +206,26 @@ func (g *GlobalASA) executeHandler(host ASPHostEnvironment, handlerIdx int, hand
 	}
 
 	return nil
+}
+
+// jsGetDeclaredName retrieves an existing JScript binding without treating a
+// missing event handler as an unresolved identifier runtime error.
+func (vm *VM) jsGetDeclaredName(name string) (Value, bool) {
+	vm.ensureJSRootEnv()
+	for envID := vm.jsActiveEnvID; envID != 0; {
+		env := vm.jsEnvItems[envID]
+		if env == nil {
+			break
+		}
+		if value, ok := env.bindings[name]; ok {
+			return value, true
+		}
+		envID = env.parentID
+	}
+	if idx, ok := vm.lookupJSGlobalIndex(name); ok {
+		return vm.Globals[idx], true
+	}
+	return Value{Type: VTJSUndefined}, false
 }
 
 // ExecuteApplicationOnStart executes the Application_OnStart event.

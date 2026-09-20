@@ -27,7 +27,24 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestADODBDateTimeValuePreservesDateType(t *testing.T) {
+	vm := NewVM(nil, nil, 5)
+	want := time.Date(2012, time.November, 21, 3, 59, 0, 0, time.UTC)
+
+	got := vm.adodbValueToVMValue(want)
+	if got.Type != VTDate {
+		t.Fatalf("expected ADODB time.Time value to remain VTDate, got %#v", got)
+	}
+	if got.Num != want.UnixNano() {
+		t.Fatalf("unexpected ADODB date payload: got %d, want %d", got.Num, want.UnixNano())
+	}
+	if milliseconds := vm.jsToNumber(got); milliseconds.Type != VTDouble || milliseconds.Flt != float64(want.UnixMilli()) {
+		t.Fatalf("unexpected JScript date numeric coercion: %#v", milliseconds)
+	}
+}
 
 // TestVMServerFSOGetStandardStreamCompatibility verifies GetStandardStream returns TextStream objects with stable cursor properties.
 func TestVMServerFSOGetStandardStreamCompatibility(t *testing.T) {

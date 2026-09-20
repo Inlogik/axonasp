@@ -497,7 +497,7 @@ func (vm *VM) dispatchFSORootMethod(_ *fsoNativeObject, member string, args []Va
 		}
 		path, ok := vm.fsoResolvePath(args[0].String())
 		if !ok {
-			return Value{Type: VTEmpty}
+			vm.raise(vbscript.PathNotFound, "Path not found")
 		}
 		overwrite := vm.fsoOverwriteDefault(args, 1, true)
 		flags := os.O_CREATE | os.O_WRONLY
@@ -530,7 +530,7 @@ func (vm *VM) dispatchFSORootMethod(_ *fsoNativeObject, member string, args []Va
 		}
 		stream := vm.fsoOpenTextStream(path, mode, create)
 		if stream == nil {
-			return Value{Type: VTEmpty}
+			vm.raise(vbscript.FileNotFound, "File not found")
 		}
 		return vm.newFSONativeObject(fsoKindTextStream, path, stream)
 	case strings.EqualFold(member, "GetSpecialFolder"):
@@ -1506,6 +1506,10 @@ func (vm *VM) fsoResolvePath(path string) (string, bool) {
 	if trimmed == "" {
 		return "", false
 	}
+	// Classic ASP applications commonly construct filesystem paths with the
+	// Windows separator. Treat it as a separator on every supported host before
+	// resolving and sandboxing the path.
+	trimmed = strings.ReplaceAll(trimmed, "\\", string(os.PathSeparator))
 
 	rootPath := vm.host.Server().MapPath("/")
 	currentDir := ""

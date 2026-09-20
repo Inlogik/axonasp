@@ -286,6 +286,17 @@ func TestNewWebHostLoadsBodyOnBinaryRead(t *testing.T) {
 	}
 }
 
+func TestNewWebHostConfiguresExternalFilesystemAccess(t *testing.T) {
+	original := AllowExternalFilesystemAccess
+	defer func() { AllowExternalFilesystemAccess = original }()
+
+	AllowExternalFilesystemAccess = true
+	host := NewWebHost(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://example.local/default.asp", nil))
+	if !host.Server().UnrestrictedFS() {
+		t.Fatal("expected configured external filesystem access on the ASP host")
+	}
+}
+
 // TestWebHostBinaryResponsePreservesHeadersAndBytes verifies HTTP responses keep binary bytes intact and do not append a charset to image content types.
 func TestWebHostBinaryResponsePreservesHeadersAndBytes(t *testing.T) {
 	source := `<%

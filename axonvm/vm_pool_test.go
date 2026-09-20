@@ -30,6 +30,14 @@ import (
 	"time"
 )
 
+func TestProgramPoolCreatesNoEagerVMs(t *testing.T) {
+	program := CachedProgram{SourceName: t.Name(), ProgramHash: 1}
+	pool := getProgramPool(program)
+	if got := len(pool.items); got != 0 {
+		t.Fatalf("new program pool eagerly allocated %d VMs", got)
+	}
+}
+
 // TestAcquireVMFromCachedProgramResetsState verifies pooled VMs restore immutable program state
 // and clear request-scoped data before being reused by another execution.
 func TestAcquireVMFromCachedProgramResetsState(t *testing.T) {
@@ -113,8 +121,8 @@ func TestAcquireVMFromCachedProgramResetsJScriptState(t *testing.T) {
 	vm.jsThisValue = NewString("dirty-this")
 	vm.jsObjectItems[20001] = map[string]Value{"x": NewInteger(1)}
 	vm.jsFunctionItems[20002] = &jsFunctionObject{name: "dirtyFn"}
-	vm.jsForInItems[1] = &jsForInEnumerator{keys: []string{"k"}, index: 0}
-	vm.jsForOfItems[2] = &jsForOfEnumerator{values: []Value{NewString("v")}, index: 0}
+	vm.jsForInItems[jsLoopEnumeratorKey{opPos: 1, envID: 1}] = &jsForInEnumerator{keys: []string{"k"}, index: 0}
+	vm.jsForOfItems[jsLoopEnumeratorKey{opPos: 2, envID: 1}] = &jsForOfEnumerator{values: []Value{NewString("v")}, index: 0}
 	vm.jsEnvItems[20003] = &jsEnvFrame{parentID: 0, bindings: map[string]Value{"x": NewInteger(1)}}
 
 	vm.Release()

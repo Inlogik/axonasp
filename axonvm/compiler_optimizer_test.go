@@ -286,6 +286,108 @@ func TestJScriptChainedFolding(t *testing.T) {
 	}
 }
 
+func TestJScriptResponseWriteStatementUsesDirectOutputOpcodes(t *testing.T) {
+	source := `<%@ Language="JScript" %><p><%= 2 + 3 %></p>`
+	compiler := NewASPCompiler(source)
+	if err := compiler.Compile(); err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+
+	bytecode := compiler.Bytecode()
+	if !scanBytecodeForOp(bytecode, OpWriteStatic) {
+		t.Error("expected static ASP markup to compile to OpWriteStatic")
+	}
+	if !scanBytecodeForExtOp(bytecode, ExtOpJSWrite) {
+		t.Error("expected JScript ASP expression to compile to direct ExtOpJSWrite")
+	}
+	if scanBytecodeForOp(bytecode, OpJSCallMember) {
+		t.Error("did not expect generic OpJSCallMember for intrinsic Response.Write statements")
+	}
+
+	out := runVBSAndGetOutput(t, source)
+	if out != "<p>5</p>" {
+		t.Fatalf("unexpected output: got %q, want %q", out, "<p>5</p>")
+	}
+}
+
+func TestJScriptShadowedResponseWriteKeepsGenericDispatch(t *testing.T) {
+	source := `<%@ Language="JScript" %><%
+var Response = { Write: function(value) { return value + "!"; } };
+var result = Response.Write("local");
+%><%= result %>`
+	compiler := NewASPCompiler(source)
+	if err := compiler.Compile(); err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+
+	if !scanBytecodeForOp(compiler.Bytecode(), OpJSCallMember) {
+		t.Error("expected shadowed Response.Write to retain generic member dispatch")
+	}
+
+	out := runVBSAndGetOutput(t, source)
+	if out != "local!" {
+		t.Fatalf("unexpected output: got %q, want %q", out, "local!")
+	}
+}
+
+func TestJScriptDirectResponseWritePreservesConversions(t *testing.T) {
+	source := `<%@ Language="JScript" %><%
+Response.Write(null);
+Response.Write("|");
+Response.Write(undefined);
+Response.Write("|");
+Response.Write([1, 2, 3]);
+Response.Write("|");
+Response.Write({ value: 1 });
+Response.Write("|");
+Response.Write(function named() {});
+%>`
+	out := runVBSAndGetOutput(t, source)
+	if out != "null||1,2,3|[object Object]|(function named() {})" {
+		t.Fatalf("unexpected direct-write conversions: got %q", out)
+	}
+}
+
+func TestJScriptResponseWriteFallbackShapes(t *testing.T) {
+	source := `<%@ Language="JScript" %><%
+Response.Write();
+Response.Write("A", "B");
+Response["Write"]("C");
+var result = Response.Write("D");
+Response.Write(typeof result);
+%>`
+	compiler := NewASPCompiler(source)
+	if err := compiler.Compile(); err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	if !scanBytecodeForOp(compiler.Bytecode(), OpJSCallMember) {
+		t.Error("expected unsupported Response.Write shapes to retain generic member dispatch")
+	}
+	if !scanBytecodeForOp(compiler.Bytecode(), OpJSCallComputedMember) {
+		t.Error("expected computed Response.Write call to retain computed member dispatch")
+	}
+
+	out := runVBSAndGetOutput(t, source)
+	if out != "ACDundefined" {
+		t.Fatalf("unexpected fallback output: got %q, want %q", out, "ACDundefined")
+	}
+}
+
+func TestJScriptDirectResponseWriteIsCaseInsensitive(t *testing.T) {
+	source := `<%@ Language="JScript" %><% response.write("ok"); %>`
+	compiler := NewASPCompiler(source)
+	if err := compiler.Compile(); err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	if !scanBytecodeForOp(compiler.Bytecode(), OpWriteStatic) {
+		t.Error("expected lowercase intrinsic response.write to compile directly")
+	}
+	out := runVBSAndGetOutput(t, source)
+	if out != "ok" {
+		t.Fatalf("unexpected lowercase direct-write output: got %q", out)
+	}
+}
+
 // TestVBScriptDirectMathOpcodes verifies that hot unary math builtins compile
 // to dedicated opcodes instead of generic OpCall dispatch.
 func TestVBScriptDirectMathOpcodes(t *testing.T) {
