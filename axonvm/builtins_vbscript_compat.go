@@ -726,9 +726,6 @@ func resolveCallable(vm *VM, v Value) Value {
 				if len(collectionValue.Values) == 0 {
 					isJS := len(vm.jsCallStack) > 0 || vm.jsActiveEnvID != 0 || vm.jsRootEnvID != 0 || len(vm.jsTryStack) > 0 || len(vm.jsErrStack) > 0 || vm.engineMode == EngineModeJavaScript
 					if isJS {
-						if collectionValue.MissingAsEmpty {
-							return NewString("")
-						}
 						return Value{Type: VTJSUndefined}
 					}
 				}

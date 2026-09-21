@@ -1110,9 +1110,9 @@ func TestJScriptNumberCoercionViaASP(t *testing.T) {
 	}
 }
 
-// TestValueToStringEmptyRequestCollection verifies that valueToString returns ""
-// for a VTNativeObject wrapping an empty RequestCollectionValue, regardless of
-// whether the caller is in JS or VBS mode.
+// TestValueToStringEmptyRequestCollection verifies that VB-compatible string
+// conversion remains empty while JScript observes a missing collection value
+// as undefined.
 func TestValueToStringEmptyRequestCollection(t *testing.T) {
 	vm := NewVM([]byte{}, nil, 0)
 	host := NewMockHost()
@@ -1130,10 +1130,10 @@ func TestValueToStringEmptyRequestCollection(t *testing.T) {
 		t.Errorf("valueToString(empty RequestCollectionValue) = %q, want %q", result, "")
 	}
 
-	// Also verify jsToString path reaches the same result.
+	// JScript preserves the missing-value distinction.
 	jsResult := vm.jsToString(nativeVal)
-	if jsResult != "" {
-		t.Errorf("jsToString(empty RequestCollectionValue) = %q, want %q", jsResult, "")
+	if jsResult != "undefined" {
+		t.Errorf("jsToString(empty RequestCollectionValue) = %q, want %q", jsResult, "undefined")
 	}
 }
 

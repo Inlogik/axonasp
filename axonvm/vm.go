@@ -6736,10 +6736,7 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 				if value, ok := request.ServerVars.GetValue(key); ok {
 					return vm.newRequestCollectionValueItem(value)
 				}
-				// Request("missing") is still an IIS Request collection value.
-				// Preserve that distinction so string coercion yields "" while
-				// numeric JScript coercion yields NaN rather than zero.
-				return vm.newRequestCollectionValueItem(asp.RequestCollectionValue{MissingAsEmpty: true})
+				return vm.newRequestCollectionValueItem(asp.RequestCollectionValue{})
 			}
 			return emptyForCtx()
 		case strings.EqualFold(member, "QueryString"):

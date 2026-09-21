@@ -10865,6 +10865,14 @@ func (vm *VM) jsToString(v Value) string {
 	if v.Type == VTArgRef {
 		v = vm.stack[int(v.Num)]
 	}
+	if v.Type == VTNativeObject {
+		if collectionValue, exists := vm.requestCollectionValueItems[v.Num]; exists {
+			if len(collectionValue.Values) == 0 {
+				return "undefined"
+			}
+			return collectionValue.Joined()
+		}
+	}
 	// ADODB Field proxies expose their Value property as the default member.
 	// Resolve it before JScript coercion so SQL NULL follows String(null) and
 	// becomes lowercase "null", rather than the VB-style "Null" text.
