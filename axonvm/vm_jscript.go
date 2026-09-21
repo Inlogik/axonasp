@@ -126,6 +126,8 @@ type jsRegExpCacheEntry struct {
 const jsRegExpProgramCacheLimit = 1024
 const jsObjectShapePropertyLimit = 256
 const jsObjectShapeCacheLimit = 4096
+const jsEnvBindingsPoolLimit = 128
+const jsEnvBindingsPoolMaxEntries = 32
 
 type jsShapeTransition struct {
 	shapeID uint32
@@ -3632,7 +3634,7 @@ func (vm *VM) jsBeginFunctionCall(fn Value, thisVal Value, args []Value, ctorObj
 	vm.jsBlockScopeTDZ = append(make([]map[string]struct{}, 0, len(closure.capturedBlockScopeTDZ)), closure.capturedBlockScopeTDZ...)
 	vm.jsBlockScopeDepth = len(vm.jsBlockScopes)
 	envID := vm.allocJSID()
-	bindings := make(map[string]Value, len(closure.params)+2)
+	bindings := vm.jsAcquireEnvBindings(len(closure.params) + 2)
 	for i := 0; i < len(closure.params); i++ {
 		if i < len(args) {
 			bindings[closure.params[i]] = args[i]
@@ -3800,6 +3802,18 @@ func (vm *VM) jsEnvHasCapturedClosures(envID int64) bool {
 	return env != nil && env.capturedClosures > 0
 }
 
+func (vm *VM) jsAcquireEnvBindings(capacity int) map[string]Value {
+	if capacity <= jsEnvBindingsPoolMaxEntries {
+		if count := len(vm.jsEnvBindingsPool); count > 0 {
+			bindings := vm.jsEnvBindingsPool[count-1]
+			vm.jsEnvBindingsPool[count-1] = nil
+			vm.jsEnvBindingsPool = vm.jsEnvBindingsPool[:count-1]
+			return bindings
+		}
+	}
+	return make(map[string]Value, capacity)
+}
+
 // jsReleaseEnvFrame drops one non-captured JScript env frame and its transient arguments object.
 func (vm *VM) jsReleaseEnvFrame(envID int64) {
 	if envID == 0 || envID == vm.jsRootEnvID {
@@ -3813,6 +3827,7 @@ func (vm *VM) jsReleaseEnvFrame(envID int64) {
 		return
 	}
 	if env != nil && env.bindings != nil {
+		bindingCount := len(env.bindings)
 		if argsObj, hasArgs := env.bindings["arguments"]; hasArgs && argsObj.Type == VTJSObject {
 			delete(vm.jsArgumentsItems, argsObj.Num)
 			delete(vm.jsObjectItems, argsObj.Num)
@@ -3820,6 +3835,9 @@ func (vm *VM) jsReleaseEnvFrame(envID int64) {
 			delete(vm.jsObjectStateItems, argsObj.Num)
 		}
 		clear(env.bindings)
+		if bindingCount <= jsEnvBindingsPoolMaxEntries && len(vm.jsEnvBindingsPool) < jsEnvBindingsPoolLimit {
+			vm.jsEnvBindingsPool = append(vm.jsEnvBindingsPool, env.bindings)
+		}
 	}
 	env.argumentsObjID = 0
 	delete(vm.jsEnvItems, envID)
@@ -3915,7 +3933,7 @@ func (vm *VM) jsTailCallValue(callee Value, thisVal Value, args []Value) bool {
 	if !canReuseEnv {
 		vm.jsReleaseEnvFrame(vm.jsActiveEnvID)
 		envID = vm.allocJSID()
-		bindings = make(map[string]Value, len(closure.params)+2)
+		bindings = vm.jsAcquireEnvBindings(len(closure.params) + 2)
 		vm.jsEnvItems[envID] = &jsEnvFrame{parentID: closure.envID, bindings: bindings}
 	}
 

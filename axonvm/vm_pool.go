@@ -984,6 +984,9 @@ func (vm *VM) resetDynamicMaps() {
 	clear(vm.jsForInItems)
 	clear(vm.jsForOfItems)
 	clear(vm.jsEnvItems)
+	for i := range vm.jsEnvBindingsPool {
+		clear(vm.jsEnvBindingsPool[i])
+	}
 	clear(vm.jsArgumentsItems)
 	clear(vm.jsSetItems)
 	clear(vm.jsMapItems)

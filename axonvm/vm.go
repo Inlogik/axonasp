@@ -452,6 +452,7 @@ type VM struct {
 	jsForInItems                  map[jsLoopEnumeratorKey]*jsForInEnumerator
 	jsForOfItems                  map[jsLoopEnumeratorKey]*jsForOfEnumerator
 	jsEnvItems                    map[int64]*jsEnvFrame
+	jsEnvBindingsPool             []map[string]Value
 	jsArgumentsItems              map[int64]*jsArgumentsBinding
 	jsSetItems                    map[int64]map[string]Value
 	jsMapItems                    map[int64]map[string]Value
