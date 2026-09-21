@@ -57,6 +57,35 @@
         "bug",
         "code"
       ]
+    },
+    {
+      "login": "zydronium",
+      "name": "Jelle Luteijn",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1164978?v=4",
+      "profile": "https://github.com/zydronium",
+      "contributions": [
+        "bug"
+      ]
+    },
+    {
+      "login": "saborrie",
+      "name": "Steven Borrie",
+      "avatar_url": "https://avatars.githubusercontent.com/u/4096734?v=4",
+      "profile": "https://github.com/saborrie",
+      "contributions": [
+        "bug",
+        "code"
+      ]
+    },
+    {
+      "login": "schotime",
+      "name": "Adam Schroder",
+      "avatar_url": "https://avatars.githubusercontent.com/u/202923?v=4",
+      "profile": "https://github.com/schotime",
+      "contributions": [
+        "bug",
+        "code"
+      ]
     }
   ],
   "contributorsPerLine": 7,

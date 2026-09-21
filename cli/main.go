@@ -35,9 +35,9 @@ import (
 	"sync"
 	"time"
 
-	"g3pix.com.br/axonasp/axonconfig"
-	"g3pix.com.br/axonasp/axonvm"
-	"g3pix.com.br/axonasp/axonvm/asp"
+	"g3pix.com.br/axonasp/v2/axonconfig"
+	"g3pix.com.br/axonasp/v2/axonvm"
+	"g3pix.com.br/axonasp/v2/axonvm/asp"
 	"github.com/gdamore/tcell/v2"
 	"github.com/joho/godotenv"
 	"github.com/rivo/tview"
@@ -112,6 +112,7 @@ const tuiHelpText = `
 
 
  ABOUT:
+ 
   G3pix ❖ AxonASP
   is a high-performance, cross-platform Classic ASP engine,
   with support to VBScript and JScript for Web, FastCGI, 
@@ -946,6 +947,11 @@ func newCLIHost(out *bytes.Buffer, requestPath string, tuiMode bool) *axonvm.Moc
 	host.Request().ServerVars.Add("REQUEST_METHOD", "CLI")
 	host.Request().ServerVars.Add("URL", requestPath)
 	host.Request().ServerVars.Add("PATH_TRANSLATED", filepath.Join(serverRootDir, filepath.FromSlash(strings.TrimPrefix(requestPath, "/"))))
+	serverPort := os.Getenv("SERVER_PORT")
+	if serverPort == "" {
+		serverPort = "80"
+	}
+	host.Request().ServerVars.Add("SERVER_PORT", serverPort)
 	if tuiMode {
 		host.Request().ServerVars.Add("AXONASP_CLI_TUI", "1")
 	}

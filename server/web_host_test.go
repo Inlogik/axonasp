@@ -30,8 +30,8 @@ import (
 	"strings"
 	"testing"
 
-	"g3pix.com.br/axonasp/axonvm"
-	"g3pix.com.br/axonasp/axonvm/asp"
+	"g3pix.com.br/axonasp/v2/axonvm"
+	"g3pix.com.br/axonasp/v2/axonvm/asp"
 )
 
 type countingReadCloser struct {
@@ -283,6 +283,17 @@ func TestNewWebHostLoadsBodyOnBinaryRead(t *testing.T) {
 	}
 	if body.reads == 0 {
 		t.Fatalf("expected body reads after BinaryRead")
+	}
+}
+
+func TestNewWebHostConfiguresExternalFilesystemAccess(t *testing.T) {
+	original := AllowExternalFilesystemAccess
+	defer func() { AllowExternalFilesystemAccess = original }()
+
+	AllowExternalFilesystemAccess = true
+	host := NewWebHost(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://example.local/default.asp", nil))
+	if !host.Server().UnrestrictedFS() {
+		t.Fatal("expected configured external filesystem access on the ASP host")
 	}
 }
 

@@ -45,7 +45,7 @@ import (
 const (
 	scriptCacheDependencyMapLimit = 1000
 	scriptCacheMagicSize          = 6
-	scriptCacheBinaryVersion      = uint16(14)
+	scriptCacheBinaryVersion      = uint16(21)
 	scriptCacheDebounceWindow     = 1000 * time.Millisecond
 )
 
@@ -949,7 +949,7 @@ func (c *ScriptCache) LoadOrCompileWithModeAndOptions(filePath string, mode Exec
 			return nil, statErr
 		}
 
-		if c.mode.HasDiskTier() && strings.TrimSpace(options.IncludeSiteRoot) == "" {
+		if c.mode.HasDiskTier() {
 			if program, found := c.loadDiskProgram(normalized, sourceInfo); found {
 				if c.mode.HasMemoryTier() {
 					c.putByCacheKey(cacheKey, program, program.IncludeDependencies, estimateProgramSizeBytes(program))
@@ -985,7 +985,7 @@ func (c *ScriptCache) LoadOrCompileWithModeAndOptions(filePath string, mode Exec
 
 		program := buildCachedProgramFromCompiler(compiler)
 
-		if c.mode.HasDiskTier() && strings.TrimSpace(options.IncludeSiteRoot) == "" {
+		if c.mode.HasDiskTier() {
 			if storeErr := c.storeDiskProgram(normalized, sourceInfo.ModTime(), program); storeErr != nil {
 				log.Printf("Warning: failed to persist bytecode cache to disk for %s: %v", normalized, storeErr)
 			}

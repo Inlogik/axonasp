@@ -23,9 +23,9 @@ package axonvm
 import (
 	"errors"
 
-	"g3pix.com.br/axonasp/axonvm/asp"
-	"g3pix.com.br/axonasp/jscript"
-	"g3pix.com.br/axonasp/vbscript"
+	"g3pix.com.br/axonasp/v2/axonvm/asp"
+	"g3pix.com.br/axonasp/v2/jscript"
+	"g3pix.com.br/axonasp/v2/vbscript"
 )
 
 // CompilerErrorToASPError converts compiler failures into the ASPError object model.
@@ -34,16 +34,14 @@ func CompilerErrorToASPError(err error, file string) *asp.ASPError {
 		return asp.NewASPError()
 	}
 
-	var jsSyntaxErr *jscript.JSSyntaxError
-	if errors.As(err, &jsSyntaxErr) {
+	if jsSyntaxErr, ok := errors.AsType[*jscript.JSSyntaxError](err); ok {
 		if jsSyntaxErr.File == "" {
 			jsSyntaxErr.WithFile(file)
 		}
 		return asp.NewASPErrorFromJSSyntaxError(jsSyntaxErr)
 	}
 
-	var syntaxErr *vbscript.VBSyntaxError
-	if errors.As(err, &syntaxErr) {
+	if syntaxErr, ok := errors.AsType[*vbscript.VBSyntaxError](err); ok {
 		if syntaxErr.File == "" {
 			syntaxErr.WithFile(file)
 		}
@@ -59,8 +57,7 @@ func RuntimeErrorToASPError(err error, file string) *asp.ASPError {
 		return asp.NewASPError()
 	}
 
-	var vmErr *VMError
-	if errors.As(err, &vmErr) {
+	if vmErr, ok := errors.AsType[*VMError](err); ok {
 		if vmErr.File == "" {
 			vmErr.WithFile(file)
 		}

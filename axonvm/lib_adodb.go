@@ -23,6 +23,7 @@
 package axonvm
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"maps"
@@ -40,7 +41,7 @@ import (
 	"unicode"
 	"unicode/utf16"
 
-	"g3pix.com.br/axonasp/vbscript"
+	"g3pix.com.br/axonasp/v2/vbscript"
 	_ "github.com/denisenkom/go-mssqldb"
 	"github.com/go-ole/go-ole"
 	"github.com/go-ole/go-ole/oleutil"
@@ -107,6 +108,7 @@ type adodbConnection struct {
 	mode              int
 	errors            []adodbError
 	db                *sql.DB
+	dbConn            *sql.Conn
 	dbDriver          string
 	tx                *sql.Tx
 	oleConnection     *ole.IDispatch
@@ -242,6 +244,22 @@ func (vm *VM) newADODBCommand() Value {
 
 // dispatchADODBMethod routes ADODB method calls.
 func (vm *VM) dispatchADODBMethod(objID int64, member string, args []Value) (Value, bool) {
+	// SQL-backed objects are pure Go and do not require COM apartment dispatch.
+	conn, hasConn := vm.adodbConnectionItems[objID]
+	rs, hasRecordset := vm.adodbRecordsetItems[objID]
+	cmd, hasCommand := vm.adodbCommandItems[objID]
+	if !hasConn && !hasRecordset && !hasCommand {
+		return Value{Type: VTEmpty}, false
+	}
+	if hasConn && conn.oleConnection == nil {
+		return vm.dispatchADODBConnectionMethod(conn, member, args), true
+	}
+	if hasRecordset && rs.oleRecordset == nil {
+		return vm.dispatchADODBRecordsetMethod(rs, member, args), true
+	}
+	if hasCommand {
+		return vm.dispatchADODBCommandMethod(cmd, member, args), true
+	}
 	var ret Value
 	var ok bool
 	vm.runOnSTA(func() {
@@ -266,6 +284,25 @@ func (vm *VM) dispatchADODBMethod(objID int64, member string, args []Value) (Val
 
 // dispatchADODBPropertyGet resolves ADODB property reads.
 func (vm *VM) dispatchADODBPropertyGet(objID int64, member string) (Value, bool) {
+	conn, hasConn := vm.adodbConnectionItems[objID]
+	rs, hasRecordset := vm.adodbRecordsetItems[objID]
+	cmd, hasCommand := vm.adodbCommandItems[objID]
+	param, hasParameter := vm.adodbParameterItems[objID]
+	if !hasConn && !hasRecordset && !hasCommand && !hasParameter {
+		return Value{Type: VTEmpty}, false
+	}
+	if hasConn && conn.oleConnection == nil {
+		return vm.dispatchADODBConnectionPropertyGet(conn, member), true
+	}
+	if hasRecordset && rs.oleRecordset == nil {
+		return vm.dispatchADODBRecordsetPropertyGet(rs, member), true
+	}
+	if hasCommand {
+		return vm.dispatchADODBCommandPropertyGet(cmd, member), true
+	}
+	if hasParameter {
+		return vm.dispatchADODBParameterPropertyGet(param, member), true
+	}
 	var ret Value
 	var ok bool
 	vm.runOnSTA(func() {
@@ -284,12 +321,36 @@ func (vm *VM) dispatchADODBPropertyGet(objID int64, member string) (Value, bool)
 			ok = true
 			return
 		}
+		if param, exists := vm.adodbParameterItems[objID]; exists {
+			ret = vm.dispatchADODBParameterPropertyGet(param, member)
+			ok = true
+			return
+		}
 	})
 	return ret, ok
 }
 
 // dispatchADODBPropertySet handles ADODB writable properties.
 func (vm *VM) dispatchADODBPropertySet(objID int64, member string, val Value) bool {
+	conn, hasConn := vm.adodbConnectionItems[objID]
+	rs, hasRecordset := vm.adodbRecordsetItems[objID]
+	cmd, hasCommand := vm.adodbCommandItems[objID]
+	param, hasParameter := vm.adodbParameterItems[objID]
+	if !hasConn && !hasRecordset && !hasCommand && !hasParameter {
+		return false
+	}
+	if hasConn && conn.oleConnection == nil {
+		return vm.dispatchADODBConnectionPropertySet(conn, member, val)
+	}
+	if hasRecordset && rs.oleRecordset == nil {
+		return vm.dispatchADODBRecordsetPropertySet(rs, member, val)
+	}
+	if hasCommand {
+		return vm.dispatchADODBCommandPropertySet(cmd, member, val)
+	}
+	if hasParameter {
+		return vm.dispatchADODBParameterPropertySet(param, member, val)
+	}
 	var ok bool
 	vm.runOnSTA(func() {
 		if conn, exists := vm.adodbConnectionItems[objID]; exists {
@@ -302,6 +363,10 @@ func (vm *VM) dispatchADODBPropertySet(objID int64, member string, val Value) bo
 		}
 		if cmd, exists := vm.adodbCommandItems[objID]; exists {
 			ok = vm.dispatchADODBCommandPropertySet(cmd, member, val)
+			return
+		}
+		if param, exists := vm.adodbParameterItems[objID]; exists {
+			ok = vm.dispatchADODBParameterPropertySet(param, member, val)
 			return
 		}
 	})
@@ -333,6 +398,12 @@ func (vm *VM) dispatchADODBConnectionMethod(conn *adodbConnection, member string
 		return Value{Type: VTEmpty}
 	case strings.EqualFold(member, "OpenSchema"):
 		return vm.adodbConnectionOpenSchema(conn, args)
+	case strings.EqualFold(member, "Errors"):
+		// Microsoft JScript permits the ADO default-property shorthand
+		// conn.Errors(index), which is compiled as a member call on Connection.
+		errors := vm.newADODBErrorsCollection(conn)
+		result, _ := vm.dispatchADODBErrorsCollectionMethod(errors.Num, "", args)
+		return result
 	case strings.EqualFold(member, "Cancel"):
 		return Value{Type: VTEmpty}
 	}
@@ -436,12 +507,6 @@ func (vm *VM) adodbConnectionOpen(conn *adodbConnection) {
 		return
 	}
 
-	if err := db.Ping(); err != nil {
-		db.Close()
-		vm.adodbConnectionRaiseProviderError(conn, "ADODB.Connection", "ping failed: "+err.Error(), "")
-		return
-	}
-
 	// SQLite optimization
 	if driver == "sqlite" {
 		// Keep one physical connection for ADODB-like behavior and to avoid
@@ -452,7 +517,21 @@ func (vm *VM) adodbConnectionOpen(conn *adodbConnection) {
 		_, _ = db.Exec("PRAGMA busy_timeout = 6000")
 	}
 
+	dbConn, err := db.Conn(context.Background())
+	if err != nil {
+		db.Close()
+		vm.adodbConnectionRaiseProviderError(conn, "ADODB.Connection", "connection failed: "+err.Error(), "")
+		return
+	}
+	if err := dbConn.PingContext(context.Background()); err != nil {
+		dbConn.Close()
+		db.Close()
+		vm.adodbConnectionRaiseProviderError(conn, "ADODB.Connection", "ping failed: "+err.Error(), "")
+		return
+	}
+
 	conn.db = db
+	conn.dbConn = dbConn
 	conn.dbDriver = driver
 	conn.state = adStateOpen
 }
@@ -526,6 +605,10 @@ func (vm *VM) adodbConnectionClose(conn *adodbConnection) {
 		conn.tx = nil
 	}
 	if conn.db != nil {
+		if conn.dbConn != nil {
+			_ = conn.dbConn.Close()
+			conn.dbConn = nil
+		}
 		_ = conn.db.Close()
 		conn.db = nil
 	}
@@ -627,9 +710,14 @@ func (vm *VM) adodbConnectionExecute(conn *adodbConnection, args []Value) Value 
 		return Value{Type: VTEmpty}
 	}
 
-	sqlText := args[0].String()
+	sqlText := adodbNormalizeCommandText(args[0].String(), conn.dbDriver)
 	isQuery := vm.adodbIsQuery(sqlText)
 	execArgs := vm.adodbExecuteArgs(args)
+	if len(args) >= 3 {
+		// ADO Connection.Execute(CommandText, RecordsAffected, Options): the
+		// latter arguments are not SQL bind parameters.
+		execArgs = nil
+	}
 
 	if conn.db != nil {
 		if isQuery {
@@ -648,7 +736,7 @@ func (vm *VM) adodbConnectionExecute(conn *adodbConnection, args []Value) Value 
 			if conn.tx != nil {
 				rows, err = conn.tx.Query(sqlText, execArgs...)
 			} else {
-				rows, err = conn.db.Query(sqlText, execArgs...)
+				rows, err = conn.dbConn.QueryContext(context.Background(), sqlText, execArgs...)
 			}
 			if err != nil {
 				vm.adodbConnectionRaiseProviderError(conn, "ADODB.Connection.Execute", err.Error(), "")
@@ -668,7 +756,7 @@ func (vm *VM) adodbConnectionExecute(conn *adodbConnection, args []Value) Value 
 		if conn.tx != nil {
 			res, err = conn.tx.Exec(sqlText, execArgs...)
 		} else {
-			res, err = conn.db.Exec(sqlText, execArgs...)
+			res, err = conn.dbConn.ExecContext(context.Background(), sqlText, execArgs...)
 		}
 		if err != nil {
 			vm.adodbConnectionRaiseProviderError(conn, "ADODB.Connection.Execute", err.Error(), "")
@@ -682,6 +770,9 @@ func (vm *VM) adodbConnectionExecute(conn *adodbConnection, args []Value) Value 
 		var rsVal Value
 		var executed bool
 		vm.runOnSTA(func() {
+			// RecordsAffected is an optional ByRef VARIANT. Calling with only the
+			// command text lets ADO supply its defaults and matches callers that
+			// ignore the output value.
 			res, err := oleutil.CallMethod(conn.oleConnection, "Execute", sqlText)
 			if err != nil {
 				vm.adodbConnectionRaiseProviderError(conn, "ADODB.Connection.Execute", "OLE: "+err.Error(), "")
@@ -721,7 +812,7 @@ func (vm *VM) adodbConnectionBeginTrans(conn *adodbConnection) Value {
 	if conn.db == nil {
 		return NewInteger(0)
 	}
-	tx, err := conn.db.Begin()
+	tx, err := conn.dbConn.BeginTx(context.Background(), nil)
 	if err != nil {
 		vm.adodbConnectionRaiseProviderError(conn, "ADODB.Connection.BeginTrans", err.Error(), "")
 		return NewInteger(0)
@@ -848,12 +939,10 @@ func (vm *VM) dispatchADODBRecordsetMethod(rs *adodbRecordset, member string, ar
 	case member == "":
 		if len(args) > 0 {
 			if vm.adodbRecordsetIsLiveOLE(rs) {
-				key := vm.adodbRecordsetResolveColumnKey(rs, args[0])
-				if idx, exists := rs.columnIndexByLower[key]; exists && idx >= 0 && idx < len(rs.columns) {
-					key = rs.columns[idx]
-				}
-				if key != "" {
+				selector := vm.adodbOLEFieldSelector(args[0])
+				if selector != "" {
 					if len(args) > 1 {
+						key := vm.adodbRecordsetResolveColumnKey(rs, args[0])
 						if vm.adodbOLESetFieldValue(rs, key, args[len(args)-1]) {
 							if rs.editMode != adEditAdd {
 								rs.editMode = adEditInProgress
@@ -862,7 +951,7 @@ func (vm *VM) dispatchADODBRecordsetMethod(rs *adodbRecordset, member string, ar
 						}
 						return Value{Type: VTEmpty}
 					}
-					if v, ok := vm.adodbOLEGetFieldValue(rs, key); ok {
+					if v, ok := vm.adodbOLEGetFieldValueBySelector(rs, selector); ok {
 						return v
 					}
 				}
@@ -870,6 +959,12 @@ func (vm *VM) dispatchADODBRecordsetMethod(rs *adodbRecordset, member string, ar
 			if rs.state == adStateOpen && rs.currentRow >= 0 && rs.currentRow < len(rs.data) {
 				row := rs.data[rs.currentRow]
 				if row != nil {
+					if (args[0].Type == VTInteger || args[0].Type == VTDouble) && len(args) == 1 {
+						idx := vm.asInt(args[0])
+						if idx >= 0 && idx < len(rs.columns) {
+							return vm.adodbRecordsetValueByOrdinal(rs, row, idx)
+						}
+					}
 					key := vm.adodbRecordsetResolveColumnKey(rs, args[0])
 					if key != "" {
 						if len(args) > 1 {
@@ -1165,7 +1260,6 @@ func (vm *VM) adodbRecordsetOpen(rs *adodbRecordset, sqlText string, conn *adodb
 	if strings.TrimSpace(sqlText) != "" {
 		rs.source = sqlText
 	}
-
 	if conn == nil && strings.TrimSpace(sqlText) == "" && len(rs.columns) > 0 {
 		if rs.data == nil {
 			rs.data = make([]map[string]Value, 0)
@@ -1196,7 +1290,7 @@ func (vm *VM) adodbRecordsetOpen(rs *adodbRecordset, sqlText string, conn *adodb
 	sqlText = vm.adodbNormalizeRecordsetSource(sqlText, conn)
 
 	if conn.db != nil {
-		rows, err := conn.db.Query(sqlText)
+		rows, err := conn.dbConn.QueryContext(context.Background(), sqlText)
 		if err != nil {
 			vm.adodbConnectionRaiseProviderError(conn, "ADODB.Recordset.Open", err.Error(), "")
 			return
@@ -1321,6 +1415,26 @@ func (vm *VM) adodbRecordsetRebuildColumnIndex(rs *adodbRecordset) {
 	}
 }
 
+// adodbOLEFieldSelector preserves numeric selectors for the COM Fields.Item
+// default property while normalizing named selectors to strings.
+func (vm *VM) adodbOLEFieldSelector(selector Value) any {
+	if selector.Type == VTInteger || selector.Type == VTDouble {
+		return vm.asInt(selector)
+	}
+	return selector.String()
+}
+
+// adodbRecordsetValueByOrdinal returns one materialized field by its ordinal.
+func (vm *VM) adodbRecordsetValueByOrdinal(rs *adodbRecordset, row map[string]Value, index int) Value {
+	if rs == nil || row == nil || index < 0 || index >= len(rs.columns) {
+		return Value{Type: VTEmpty}
+	}
+	if value, ok := row[strings.ToLower(strings.TrimSpace(rs.columns[index]))]; ok {
+		return value
+	}
+	return Value{Type: VTEmpty}
+}
+
 // adodbRecordsetClearPendingUpdateFields resets tracked changed columns for one recordset edit cycle.
 func (vm *VM) adodbRecordsetClearPendingUpdateFields(rs *adodbRecordset) {
 	if rs == nil {
@@ -1418,6 +1532,22 @@ func (vm *VM) adodbRecordsetLoadCurrentSQLResultSet(rs *adodbRecordset) {
 		rs.columns = cols
 	}
 	vm.adodbRecordsetRebuildColumnIndex(rs)
+	if columnTypes, typeErr := rows.ColumnTypes(); typeErr == nil {
+		rs.columnTypes = make([]string, len(columnTypes))
+		for i, columnType := range columnTypes {
+			databaseType := columnType.DatabaseTypeName()
+			rs.columnTypes[i] = databaseType
+			if i < len(cols) {
+				rs.columnTypeByName[strings.ToLower(cols[i])] = adodbTypeFromDatabaseType(databaseType)
+				if length, ok := columnType.Length(); ok {
+					rs.columnSizeByName[strings.ToLower(cols[i])] = int(length)
+				}
+				if _, scale, ok := columnType.DecimalSize(); ok {
+					rs.columnScaleByName[strings.ToLower(cols[i])] = int(scale)
+				}
+			}
+		}
+	}
 	rs.data = make([]map[string]Value, 0)
 
 	for rows.Next() {
@@ -1439,6 +1569,13 @@ func (vm *VM) adodbRecordsetLoadCurrentSQLResultSet(rs *adodbRecordset) {
 		}
 		rs.data = append(rs.data, rowMap)
 	}
+	// A client-side ADO Recordset is fully materialized. Release the driver's
+	// active rows so the same physical ADODB.Connection can execute another
+	// command without waiting for the Recordset to be explicitly closed.
+	if !rows.NextResultSet() {
+		_ = rows.Close()
+		rs.sqlRows = nil
+	}
 
 	rs.recordCount = len(rs.data)
 	rs.state = adStateOpen
@@ -1454,6 +1591,45 @@ func (vm *VM) adodbRecordsetLoadCurrentSQLResultSet(rs *adodbRecordset) {
 	rs.currentRow = -1
 	rs.eof = true
 	rs.bof = true
+}
+
+// adodbTypeFromDatabaseType maps database/sql metadata to the ADO DataTypeEnum
+// values consumed by legacy code through ADODB.Field.Type.
+func adodbTypeFromDatabaseType(databaseType string) int {
+	switch strings.ToUpper(strings.TrimSpace(databaseType)) {
+	case "BIT", "BOOLEAN", "BOOL":
+		return 11 // adBoolean
+	case "TINYINT", "UTINYINT":
+		return 17 // adUnsignedTinyInt
+	case "SMALLINT", "SHORT":
+		return 2 // adSmallInt
+	case "INTEGER", "INT", "MEDIUMINT":
+		return 3 // adInteger
+	case "BIGINT", "INT8":
+		return 20 // adBigInt
+	case "REAL", "FLOAT":
+		return 4 // adSingle
+	case "DOUBLE", "DOUBLE PRECISION":
+		return 5 // adDouble
+	case "DECIMAL", "NUMERIC", "MONEY", "SMALLMONEY":
+		return 131 // adNumeric
+	case "DATE":
+		return 133 // adDBDate
+	case "TIME":
+		return 134 // adDBTime
+	case "DATETIME", "DATETIME2", "SMALLDATETIME", "TIMESTAMP":
+		return 135 // adDBTimeStamp
+	case "BINARY", "VARBINARY", "IMAGE", "BLOB", "BYTEA":
+		return 204 // adVarBinary
+	case "CHAR", "VARCHAR", "TEXT", "STRING", "CLOB":
+		return 200 // adVarChar
+	case "NCHAR", "NVARCHAR", "NTEXT", "NCLOB":
+		return 202 // adVarWChar
+	case "UNIQUEIDENTIFIER", "UUID":
+		return 72 // adGUID
+	default:
+		return 12 // adVariant preserves values for unknown provider types
+	}
 }
 
 // adodbRecordsetNextRecordset advances to the next SQL result set and returns a new Recordset object.
@@ -1997,6 +2173,20 @@ func (vm *VM) adodbRecordsetGetString(rs *adodbRecordset, args []Value) Value {
 
 func (vm *VM) dispatchADODBCommandMethod(cmd *adodbCommand, member string, args []Value) Value {
 	switch {
+	case member == "":
+		// ADODB.Command exposes its Parameters collection as the default
+		// property. Microsoft JScript uses cmd("name") = value to assign a
+		// parameter before Execute.
+		if len(args) >= 2 {
+			name := args[0].String()
+			for _, param := range cmd.parameters {
+				if strings.EqualFold(param.name, name) {
+					param.value = args[len(args)-1]
+					return Value{Type: VTEmpty}
+				}
+			}
+		}
+		return Value{Type: VTEmpty}
 	case strings.EqualFold(member, "Execute"):
 		return vm.adodbCommandExecute(cmd, args)
 	case strings.EqualFold(member, "CreateParameter"):
@@ -2069,8 +2259,13 @@ func (vm *VM) adodbCommandExecute(cmd *adodbCommand, args []Value) Value {
 		params[i] = p.value
 	}
 
-	// For now, reuse connection execute
-	return vm.adodbConnectionExecute(conn, []Value{NewString(cmd.commandText)})
+	if len(params) == 0 {
+		return vm.adodbConnectionExecute(conn, []Value{NewString(cmd.commandText)})
+	}
+	return vm.adodbConnectionExecute(conn, []Value{
+		NewString(cmd.commandText),
+		ValueFromVBArray(NewVBArrayFromValues(0, params)),
+	})
 }
 
 func (vm *VM) adodbCreateParameter(cmd *adodbCommand, args []Value) Value {
@@ -2095,6 +2290,40 @@ func (vm *VM) adodbCreateParameter(cmd *adodbCommand, args []Value) Value {
 	vm.nextDynamicNativeID++
 	vm.adodbParameterItems[objID] = param
 	return Value{Type: VTNativeObject, Num: objID}
+}
+
+func (vm *VM) dispatchADODBParameterPropertyGet(param *adodbParameter, member string) Value {
+	switch {
+	case strings.EqualFold(member, "Name"):
+		return NewString(param.name)
+	case strings.EqualFold(member, "Type"):
+		return NewInteger(int64(param.typ))
+	case strings.EqualFold(member, "Direction"):
+		return NewInteger(int64(param.direction))
+	case strings.EqualFold(member, "Size"):
+		return NewInteger(int64(param.size))
+	case strings.EqualFold(member, "Value"):
+		return param.value
+	}
+	return Value{Type: VTEmpty}
+}
+
+func (vm *VM) dispatchADODBParameterPropertySet(param *adodbParameter, member string, val Value) bool {
+	switch {
+	case strings.EqualFold(member, "Name"):
+		param.name = val.String()
+	case strings.EqualFold(member, "Type"):
+		param.typ = vm.asInt(val)
+	case strings.EqualFold(member, "Direction"):
+		param.direction = vm.asInt(val)
+	case strings.EqualFold(member, "Size"):
+		param.size = vm.asInt(val)
+	case strings.EqualFold(member, "Value"):
+		param.value = val
+	default:
+		return false
+	}
+	return true
 }
 
 // --- Collections & Proxies ---
@@ -2176,6 +2405,9 @@ func (vm *VM) dispatchADODBErrorPropertyGet(objID int64, member string) (Value, 
 		return Value{Type: VTEmpty}, false
 	}
 	if strings.EqualFold(member, "Number") {
+		return NewInteger(int64(errObj.number)), true
+	}
+	if strings.EqualFold(member, "NativeError") {
 		return NewInteger(int64(errObj.number)), true
 	}
 	if strings.EqualFold(member, "Description") {
@@ -2380,6 +2612,13 @@ func (vm *VM) adodbFieldChunkOffsetSet(field *adodbFieldProxy, offset int) {
 }
 
 func (vm *VM) dispatchADODBFieldMethod(objID int64, member string, args []Value) (Value, bool) {
+	field, exists := vm.adodbFieldItems[objID]
+	if !exists || field == nil || field.rs == nil {
+		return Value{Type: VTEmpty}, false
+	}
+	if field.rs.oleRecordset == nil {
+		return vm.dispatchADODBFieldMethodDirect(field, objID, member, args)
+	}
 	var ret Value
 	var ok bool
 	vm.runOnSTA(func() {
@@ -2435,7 +2674,45 @@ func (vm *VM) dispatchADODBFieldMethod(objID int64, member string, args []Value)
 	return Value{Type: VTEmpty}, false
 }
 
+func (vm *VM) dispatchADODBFieldMethodDirect(field *adodbFieldProxy, objID int64, member string, args []Value) (Value, bool) {
+	switch {
+	case strings.EqualFold(member, "AppendChunk"):
+		if len(args) >= 1 {
+			current, _ := vm.dispatchADODBFieldPropertyGet(objID, "Value")
+			vm.dispatchADODBFieldPropertySet(objID, "Value", NewString(current.String()+args[0].String()))
+			field.rs.editMode = adEditInProgress
+		}
+		return Value{Type: VTEmpty}, true
+	case strings.EqualFold(member, "GetChunk"):
+		value, _ := vm.dispatchADODBFieldPropertyGet(objID, "Value")
+		all := value.String()
+		offset := min(vm.adodbFieldChunkOffsetGet(field), len(all))
+		want := len(all) - offset
+		if len(args) >= 1 {
+			want = min(max(vm.asInt(args[0]), 0), want)
+		}
+		if want <= 0 {
+			return NewString(""), true
+		}
+		end := min(offset+want, len(all))
+		vm.adodbFieldChunkOffsetSet(field, end)
+		return NewString(all[offset:end]), true
+	case member == "":
+		if field.rs.state == adStateOpen && field.rs.currentRow >= 0 && field.rs.currentRow < len(field.rs.data) {
+			return field.rs.data[field.rs.currentRow][field.cachedLowerName], true
+		}
+	}
+	return Value{Type: VTEmpty}, false
+}
+
 func (vm *VM) dispatchADODBFieldPropertyGet(objID int64, member string) (Value, bool) {
+	field, exists := vm.adodbFieldItems[objID]
+	if !exists || field == nil || field.rs == nil {
+		return Value{Type: VTEmpty}, false
+	}
+	if field.rs.oleRecordset == nil {
+		return vm.dispatchADODBFieldPropertyGetDirect(field, objID, member)
+	}
 	var ret Value
 	var ok bool
 	vm.runOnSTA(func() {
@@ -2520,6 +2797,43 @@ func (vm *VM) dispatchADODBFieldPropertyGet(objID int64, member string) (Value, 
 	})
 	if ok {
 		return ret, true
+	}
+	return Value{Type: VTEmpty}, false
+}
+
+func (vm *VM) dispatchADODBFieldPropertyGetDirect(field *adodbFieldProxy, objID int64, member string) (Value, bool) {
+	switch {
+	case strings.EqualFold(member, "Value") || strings.EqualFold(member, "__default__") || member == "":
+		if field.rs.state == adStateOpen && field.rs.currentRow >= 0 && field.rs.currentRow < len(field.rs.data) {
+			return field.rs.data[field.rs.currentRow][field.cachedLowerName], true
+		}
+		return Value{Type: VTEmpty}, true
+	case strings.EqualFold(member, "Name"):
+		return NewString(field.name), true
+	case strings.EqualFold(member, "Type"):
+		return NewInteger(int64(field.rs.columnTypeByName[field.cachedLowerName])), true
+	case strings.EqualFold(member, "DefinedSize"):
+		return NewInteger(int64(field.rs.columnSizeByName[field.cachedLowerName])), true
+	case strings.EqualFold(member, "Attributes"):
+		return NewInteger(int64(field.rs.columnAttrByName[field.cachedLowerName])), true
+	case strings.EqualFold(member, "NumericScale"):
+		return NewInteger(int64(field.rs.columnScaleByName[field.cachedLowerName])), true
+	case strings.EqualFold(member, "ActualSize"):
+		value, _ := vm.dispatchADODBFieldPropertyGetDirect(field, objID, "Value")
+		return NewInteger(int64(len(value.String()))), true
+	case strings.EqualFold(member, "DataFormat"):
+		return Value{Type: VTEmpty}, true
+	case strings.EqualFold(member, "OriginalValue"), strings.EqualFold(member, "UnderlyingValue"):
+		return vm.dispatchADODBFieldPropertyGetDirect(field, objID, "Value")
+	case strings.EqualFold(member, "Precision"):
+		precision := field.rs.columnSizeByName[field.cachedLowerName]
+		if precision <= 0 {
+			value, _ := vm.dispatchADODBFieldPropertyGetDirect(field, objID, "Value")
+			precision = len(value.String())
+		}
+		return NewInteger(int64(precision)), true
+	case strings.EqualFold(member, "Status"):
+		return NewInteger(int64(field.rs.status)), true
 	}
 	return Value{Type: VTEmpty}, false
 }
@@ -2624,6 +2938,11 @@ func (vm *VM) adodbOLERefreshPositionFlags(rs *adodbRecordset) {
 
 // adodbOLEGetFieldValue fetches one field value from the current row of a live OLE cursor.
 func (vm *VM) adodbOLEGetFieldValue(rs *adodbRecordset, fieldName string) (Value, bool) {
+	return vm.adodbOLEGetFieldValueBySelector(rs, fieldName)
+}
+
+// adodbOLEGetFieldValueBySelector fetches a field by either its name or ordinal.
+func (vm *VM) adodbOLEGetFieldValueBySelector(rs *adodbRecordset, selector any) (Value, bool) {
 	if rs == nil || rs.oleRecordset == nil {
 		return Value{Type: VTEmpty}, false
 	}
@@ -2641,7 +2960,7 @@ func (vm *VM) adodbOLEGetFieldValue(rs *adodbRecordset, fieldName string) (Value
 	}
 	defer fields.Release()
 
-	itemRes, _ := oleutil.GetProperty(fields, "Item", fieldName)
+	itemRes, _ := oleutil.GetProperty(fields, "Item", selector)
 	if itemRes == nil {
 		return Value{Type: VTEmpty}, false
 	}
@@ -2714,6 +3033,21 @@ func (vm *VM) adodbOLESetFieldValue(rs *adodbRecordset, fieldName string, val Va
 }
 
 func (vm *VM) dispatchADODBFieldPropertySet(objID int64, member string, val Value) bool {
+	field, exists := vm.adodbFieldItems[objID]
+	if !exists || field == nil || field.rs == nil {
+		return false
+	}
+	if field.rs.oleRecordset == nil {
+		lowerName := field.cachedLowerName
+		if strings.EqualFold(member, "Value") || strings.EqualFold(member, "__default__") || member == "" {
+			if field.rs.state == adStateOpen && field.rs.currentRow >= 0 && field.rs.currentRow < len(field.rs.data) {
+				field.rs.data[field.rs.currentRow][lowerName] = val
+				field.rs.pendingUpdateFields[lowerName] = struct{}{}
+				field.rs.editMode = adEditInProgress
+			}
+			return true
+		}
+	}
 	var ok bool
 	vm.runOnSTA(func() {
 		field, exists := vm.adodbFieldItems[objID]
@@ -3063,7 +3397,7 @@ func (vm *VM) adodbExecWriteback(conn *adodbConnection, sqlText string, source s
 		if conn.tx != nil {
 			res, err = conn.tx.Exec(sqlText)
 		} else {
-			res, err = conn.db.Exec(sqlText)
+			res, err = conn.dbConn.ExecContext(context.Background(), sqlText)
 		}
 		if err != nil {
 			vm.adodbConnectionRaiseProviderError(conn, source, err.Error(), "")
@@ -3272,6 +3606,32 @@ func (vm *VM) adodbIsQuery(sql string) bool {
 	return strings.HasPrefix(s, "select") || strings.HasPrefix(s, "show") || strings.HasPrefix(s, "pragma")
 }
 
+var adodbODBCProcedureCall = regexp.MustCompile(`(?is)^\s*\{\s*call\s+(.+?)\s*\}\s*$`)
+
+// adodbNormalizeCommandText preserves ADO's acceptance of ODBC procedure-call
+// escapes when using the native SQL Server driver. OLE DB providers perform
+// this translation themselves, while database/sql drivers expect T-SQL EXEC.
+func adodbNormalizeCommandText(sqlText string, driver string) string {
+	if !strings.EqualFold(strings.TrimSpace(driver), "mssql") {
+		return sqlText
+	}
+	match := adodbODBCProcedureCall.FindStringSubmatch(sqlText)
+	if len(match) != 2 {
+		return sqlText
+	}
+	call := strings.TrimSpace(match[1])
+	open := strings.IndexByte(call, '(')
+	if open < 0 || !strings.HasSuffix(call, ")") {
+		return "EXEC " + call
+	}
+	procedure := strings.TrimSpace(call[:open])
+	arguments := strings.TrimSpace(call[open+1 : len(call)-1])
+	if arguments == "" {
+		return "EXEC " + procedure
+	}
+	return "EXEC " + procedure + " " + arguments
+}
+
 // adodbNormalizeRecordsetSource rewrites bare table names passed to Recordset.Open
 // into a SELECT * FROM query while leaving explicit SQL text untouched.
 func (vm *VM) adodbNormalizeRecordsetSource(sqlText string, conn *adodbConnection) string {
@@ -3337,6 +3697,8 @@ func (vm *VM) adodbValueToVMValue(v any) Value {
 		return vm.adodbValueToVMValue(val.Value())
 	case int32:
 		return NewInteger(int64(val))
+	case nil:
+		return NewNull()
 	case uint32:
 		return NewInteger(int64(val))
 	case uint64:
@@ -3367,7 +3729,7 @@ func (vm *VM) adodbValueToVMValue(v any) Value {
 	case bool:
 		return NewBool(val)
 	case time.Time:
-		return NewString(val.Format("2006-01-02 15:04:05"))
+		return NewDate(val)
 	case []byte:
 		return NewString(string(val))
 	}
@@ -3536,7 +3898,7 @@ func (vm *VM) adodbBuildTablesSchemaRows(conn *adodbConnection, restrictions []s
 	if query == "" {
 		return nil
 	}
-	rows, err := conn.db.Query(query)
+	rows, err := conn.dbConn.QueryContext(context.Background(), query)
 	if err != nil {
 		return nil
 	}
@@ -3627,7 +3989,7 @@ func (vm *VM) adodbBuildForeignKeysSchemaRows(conn *adodbConnection, restriction
 // adodbBuildInformationSchemaProceduresRows uses INFORMATION_SCHEMA.ROUTINES for procedure metadata.
 func (vm *VM) adodbBuildInformationSchemaProceduresRows(conn *adodbConnection, restrictions []string) []map[string]Value {
 	query := "SELECT routine_name, routine_type FROM information_schema.routines ORDER BY routine_name"
-	rows, err := conn.db.Query(query)
+	rows, err := conn.dbConn.QueryContext(context.Background(), query)
 	if err != nil {
 		return nil
 	}
@@ -3660,7 +4022,7 @@ func (vm *VM) adodbBuildInformationSchemaProceduresRows(conn *adodbConnection, r
 // adodbBuildInformationSchemaViewsRows uses INFORMATION_SCHEMA.VIEWS for view metadata.
 func (vm *VM) adodbBuildInformationSchemaViewsRows(conn *adodbConnection, restrictions []string) []map[string]Value {
 	query := "SELECT table_name FROM information_schema.views ORDER BY table_name"
-	rows, err := conn.db.Query(query)
+	rows, err := conn.dbConn.QueryContext(context.Background(), query)
 	if err != nil {
 		return nil
 	}
@@ -3710,7 +4072,7 @@ func (vm *VM) adodbBuildSQLiteColumnsSchemaRows(conn *adodbConnection, restricti
 	for i := range tables {
 		tableName := tables[i]["table_name"].String()
 		pragma := "PRAGMA table_info('" + strings.ReplaceAll(tableName, "'", "''") + "')"
-		rows, err := conn.db.Query(pragma)
+		rows, err := conn.dbConn.QueryContext(context.Background(), pragma)
 		if err != nil {
 			continue
 		}
@@ -3750,7 +4112,7 @@ func (vm *VM) adodbBuildSQLiteColumnsSchemaRows(conn *adodbConnection, restricti
 // adodbBuildInformationSchemaColumnsRows uses INFORMATION_SCHEMA.COLUMNS for SQL providers.
 func (vm *VM) adodbBuildInformationSchemaColumnsRows(conn *adodbConnection, restrictions []string) []map[string]Value {
 	query := "SELECT table_name, column_name, ordinal_position, data_type, COALESCE(character_maximum_length, numeric_precision, 0), COALESCE(numeric_scale, 0), COALESCE(is_nullable, 'YES') FROM information_schema.columns ORDER BY table_name, ordinal_position"
-	rows, err := conn.db.Query(query)
+	rows, err := conn.dbConn.QueryContext(context.Background(), query)
 	if err != nil {
 		return nil
 	}
@@ -3811,7 +4173,7 @@ func (vm *VM) adodbBuildSQLiteIndexesSchemaRows(conn *adodbConnection, restricti
 	for i := range tables {
 		tableName := tables[i]["table_name"].String()
 		listQuery := "PRAGMA index_list('" + strings.ReplaceAll(tableName, "'", "''") + "')"
-		listRows, err := conn.db.Query(listQuery)
+		listRows, err := conn.dbConn.QueryContext(context.Background(), listQuery)
 		if err != nil {
 			continue
 		}
@@ -3842,7 +4204,7 @@ func (vm *VM) adodbBuildSQLiteIndexesSchemaRows(conn *adodbConnection, restricti
 		// Step 2: query index_info for each collected entry — cursor is fully closed above.
 		for _, entry := range entries {
 			infoQuery := "PRAGMA index_info('" + strings.ReplaceAll(entry.indexName, "'", "''") + "')"
-			infoRows, infoErr := conn.db.Query(infoQuery)
+			infoRows, infoErr := conn.dbConn.QueryContext(context.Background(), infoQuery)
 			if infoErr != nil {
 				continue
 			}
@@ -3879,7 +4241,7 @@ func (vm *VM) adodbBuildSQLiteForeignKeysSchemaRows(conn *adodbConnection, restr
 	for i := range tables {
 		fkTableName := tables[i]["table_name"].String()
 		pragma := "PRAGMA foreign_key_list('" + strings.ReplaceAll(fkTableName, "'", "''") + "')"
-		rows, err := conn.db.Query(pragma)
+		rows, err := conn.dbConn.QueryContext(context.Background(), pragma)
 		if err != nil {
 			continue
 		}
@@ -3931,7 +4293,7 @@ func (vm *VM) adodbBuildMSSQLIndexesSchemaRows(conn *adodbConnection, restrictio
 
 // adodbBuildInformationSchemaIndexRows maps INFORMATION_SCHEMA index metadata into OpenSchema rows.
 func (vm *VM) adodbBuildInformationSchemaIndexRows(conn *adodbConnection, query string, restrictions []string) []map[string]Value {
-	rows, err := conn.db.Query(query)
+	rows, err := conn.dbConn.QueryContext(context.Background(), query)
 	if err != nil {
 		return nil
 	}
@@ -3974,7 +4336,7 @@ func (vm *VM) adodbBuildInformationSchemaIndexRows(conn *adodbConnection, query 
 
 // adodbBuildCatalogIndexRows maps provider catalog query output into OpenSchema rows.
 func (vm *VM) adodbBuildCatalogIndexRows(conn *adodbConnection, query string, restrictions []string, lowercaseType bool) []map[string]Value {
-	rows, err := conn.db.Query(query)
+	rows, err := conn.dbConn.QueryContext(context.Background(), query)
 	if err != nil {
 		return nil
 	}
@@ -4023,7 +4385,7 @@ func (vm *VM) adodbBuildCatalogIndexRows(conn *adodbConnection, query string, re
 // adodbBuildInformationSchemaForeignKeysRows uses INFORMATION_SCHEMA constraint views for foreign-key metadata.
 func (vm *VM) adodbBuildInformationSchemaForeignKeysRows(conn *adodbConnection, restrictions []string) []map[string]Value {
 	query := "SELECT pk.table_name AS pk_table_name, pk.column_name AS pk_column_name, fk.table_name AS fk_table_name, fk.column_name AS fk_column_name, fk.ordinal_position AS key_seq FROM information_schema.referential_constraints rc JOIN information_schema.key_column_usage fk ON rc.constraint_name = fk.constraint_name AND rc.constraint_schema = fk.constraint_schema JOIN information_schema.key_column_usage pk ON rc.unique_constraint_name = pk.constraint_name AND rc.unique_constraint_schema = pk.constraint_schema AND fk.ordinal_position = pk.ordinal_position ORDER BY fk.table_name, fk.ordinal_position"
-	rows, err := conn.db.Query(query)
+	rows, err := conn.dbConn.QueryContext(context.Background(), query)
 	if err != nil {
 		return nil
 	}
@@ -4061,7 +4423,7 @@ func (vm *VM) adodbBuildInformationSchemaForeignKeysRows(conn *adodbConnection, 
 // adodbBuildOracleProceduresSchemaRows queries USER_PROCEDURES for Oracle procedure metadata.
 func (vm *VM) adodbBuildOracleProceduresSchemaRows(conn *adodbConnection, restrictions []string) []map[string]Value {
 	query := "SELECT object_name, object_type FROM user_procedures WHERE object_type IN ('PROCEDURE','FUNCTION') ORDER BY object_name"
-	rows, err := conn.db.Query(query)
+	rows, err := conn.dbConn.QueryContext(context.Background(), query)
 	if err != nil {
 		return nil
 	}
@@ -4094,7 +4456,7 @@ func (vm *VM) adodbBuildOracleProceduresSchemaRows(conn *adodbConnection, restri
 // adodbBuildOracleViewsSchemaRows queries USER_VIEWS for Oracle view metadata.
 func (vm *VM) adodbBuildOracleViewsSchemaRows(conn *adodbConnection, restrictions []string) []map[string]Value {
 	query := "SELECT view_name FROM user_views ORDER BY view_name"
-	rows, err := conn.db.Query(query)
+	rows, err := conn.dbConn.QueryContext(context.Background(), query)
 	if err != nil {
 		return nil
 	}
@@ -4120,7 +4482,7 @@ func (vm *VM) adodbBuildOracleViewsSchemaRows(conn *adodbConnection, restriction
 // adodbBuildOracleColumnsSchemaRows queries USER_TAB_COLUMNS for Oracle column metadata.
 func (vm *VM) adodbBuildOracleColumnsSchemaRows(conn *adodbConnection, restrictions []string) []map[string]Value {
 	query := "SELECT table_name, column_name, column_id, data_type, NVL(char_length, NVL(data_precision, 0)), NVL(data_scale, 0), nullable FROM user_tab_columns ORDER BY table_name, column_id"
-	rows, err := conn.db.Query(query)
+	rows, err := conn.dbConn.QueryContext(context.Background(), query)
 	if err != nil {
 		return nil
 	}
@@ -4186,7 +4548,7 @@ func (vm *VM) adodbBuildOracleForeignKeysSchemaRows(conn *adodbConnection, restr
 		JOIN user_cons_columns pc ON p.constraint_name = pc.constraint_name AND fc.position = pc.position
 		WHERE f.constraint_type = 'R'
 		ORDER BY f.table_name, fc.position`
-	rows, err := conn.db.Query(query)
+	rows, err := conn.dbConn.QueryContext(context.Background(), query)
 	if err != nil {
 		return nil
 	}
@@ -4831,6 +5193,12 @@ func (vm *VM) adodbPopulateRecordsetFromOLE(rs *adodbRecordset) {
 			}
 			rs.columns[i] = name
 			nameRes.Clear()
+		}
+		typeRes, _ := oleutil.GetProperty(item, "Type")
+		if typeRes != nil {
+			typeValue := vm.adodbValueToVMValue(typeRes.Value())
+			rs.columnTypeByName[strings.ToLower(rs.columns[i])] = vm.asInt(typeValue)
+			typeRes.Clear()
 		}
 		item.Release()
 	}

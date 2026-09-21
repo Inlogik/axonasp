@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,13 +43,16 @@ import (
 	"golang.org/x/text/collate"
 	"golang.org/x/text/language"
 
-	"g3pix.com.br/axonasp/axonvm/asp"
-	"g3pix.com.br/axonasp/jscript"
-	"g3pix.com.br/axonasp/vbscript"
+	"g3pix.com.br/axonasp/v2/axonvm/asp"
+	"g3pix.com.br/axonasp/v2/jscript"
+	"g3pix.com.br/axonasp/v2/vbscript"
 )
 
+// StackSize is the maximum number of stack slots available for the VM. 4096 VBScript default size.
 const StackSize = 4096
-const jsBackJumpLimit = 1000000
+
+// jsBackJumpLimit is the maximum number of bytecode back-jumps (loop iterations) that can be executed before the VM raises a runtime error to prevent runaway/infinite loops. It is deliberately generous so statically-bounded high-iteration loops and benchmarks (10M+ iteration loops) complete normally; pathological self-expanding loops are caught earlier by the cumulative string-work watchdog and by the script timeout.
+const jsBackJumpLimit = 100000000
 
 const staticObjectProgIDPrefix = "__AXON_STATIC_OBJECT_PROGID__:"
 
@@ -237,7 +241,7 @@ type CallFrame struct {
 	savedOnResumeNext   bool             // On Error Resume Next state before entering this call frame; restored on OpRet.
 	savedSkipToNextStmt bool             // Per-statement Resume Next skip state before entering this call frame; restored on OpRet.
 	savedStmtSP         int              // Statement-start SP before entering this call frame; restored on OpRet.
-	throwObjectNotSet   bool             // If true, throws "Object variable not set" after returning
+	terminateObjID      int64            // Object ID being terminated if this frame is a Class_Terminate call, 0 otherwise.
 }
 
 // RuntimeClassMethodDef stores one compiled class method runtime entry.
@@ -429,6 +433,7 @@ type VM struct {
 	nativeObjectProxies            map[int64]nativeObjectProxy
 	jsObjectItems                  map[int64]map[string]Value
 	jsObjectKeyOrder               map[int64][]string
+	jsObjectKeySet                 map[int64]map[string]struct{}
 	jsObjectSlots                  map[int64][]Value
 	jsObjectSlotIndex              map[int64]map[string]uint16
 	jsObjectShape                  map[int64]uint32
@@ -439,8 +444,8 @@ type VM struct {
 	jsSymbolStateItems             map[int64]jsObjectState
 	jsPropertyItems                map[int64]map[string]jsPropertyDescriptor
 	jsFunctionItems                map[int64]*jsFunctionObject
-	jsForInItems                   map[int]*jsForInEnumerator
-	jsForOfItems                   map[int]*jsForOfEnumerator
+	jsForInItems                   map[jsLoopEnumeratorKey]*jsForInEnumerator
+	jsForOfItems                   map[jsLoopEnumeratorKey]*jsForOfEnumerator
 	jsEnvItems                     map[int64]*jsEnvFrame
 	jsArgumentsItems               map[int64]*jsArgumentsBinding
 	jsSetItems                     map[int64]map[string]Value
@@ -778,6 +783,7 @@ func NewVM(bytecode []byte, constants []Value, globalCount int) *VM {
 		nativeObjectProxies:            make(map[int64]nativeObjectProxy),
 		jsObjectItems:                  make(map[int64]map[string]Value),
 		jsObjectKeyOrder:               make(map[int64][]string),
+		jsObjectKeySet:                 make(map[int64]map[string]struct{}),
 		jsObjectSlots:                  make(map[int64][]Value),
 		jsObjectSlotIndex:              make(map[int64]map[string]uint16),
 		jsObjectShape:                  make(map[int64]uint32),
@@ -788,8 +794,8 @@ func NewVM(bytecode []byte, constants []Value, globalCount int) *VM {
 		jsSymbolStateItems:             make(map[int64]jsObjectState),
 		jsPropertyItems:                make(map[int64]map[string]jsPropertyDescriptor),
 		jsFunctionItems:                make(map[int64]*jsFunctionObject),
-		jsForInItems:                   make(map[int]*jsForInEnumerator),
-		jsForOfItems:                   make(map[int]*jsForOfEnumerator),
+		jsForInItems:                   make(map[jsLoopEnumeratorKey]*jsForInEnumerator),
+		jsForOfItems:                   make(map[jsLoopEnumeratorKey]*jsForOfEnumerator),
 		jsEnvItems:                     make(map[int64]*jsEnvFrame),
 		jsArgumentsItems:               make(map[int64]*jsArgumentsBinding),
 		jsSetItems:                     make(map[int64]map[string]Value),
@@ -1168,9 +1174,9 @@ func opcodeOperandSize(op OpCode, bytecode []byte, ip int) int {
 			return 9
 		case ExtOpFilePrint, ExtOpFileWrite:
 			return 3
-		case ExtOpFileOpen, ExtOpFileClose, ExtOpFileLineInput, ExtOpFilePut, ExtOpFileGet, ExtOpFileFreeFile, ExtOpAxonASP, ExtOpJSReThrow, ExtOpCloneRecord, ExtOpShiftLeft, ExtOpShiftRight:
+		case ExtOpFileOpen, ExtOpFileClose, ExtOpFileLineInput, ExtOpFilePut, ExtOpFileGet, ExtOpFileFreeFile, ExtOpAxonASP, ExtOpJSReThrow, ExtOpCloneRecord, ExtOpShiftLeft, ExtOpShiftRight, ExtOpJSWrite:
 			return 1
-		case ExtOpJSMathSin, ExtOpJSMathCos, ExtOpJSMathTan, ExtOpJSMathAbs, ExtOpJSMathFloor, ExtOpJSMathCeil, ExtOpJSMathRound, ExtOpJSMathSqrt, ExtOpJSMathMin, ExtOpJSMathMax:
+		case ExtOpJSMathSin, ExtOpJSMathCos, ExtOpJSMathTan, ExtOpJSMathAbs, ExtOpJSMathFloor, ExtOpJSMathCeil, ExtOpJSMathRound, ExtOpJSMathSqrt, ExtOpJSMathMin, ExtOpJSMathMax, ExtOpJSMathPow:
 			return 1
 		default:
 			return 3
@@ -1241,9 +1247,9 @@ func remapExecuteGlobalBytecode(bytecode []byte, constBase int, bytecodeBase int
 			switch ext {
 			case ExtOpInitRecord, ExtOpGetRecordMember, ExtOpSetRecordMember:
 				ip += 2
-			case ExtOpAxonASP, ExtOpJSMathSin, ExtOpJSMathCos, ExtOpJSMathTan, ExtOpJSMathAbs, ExtOpJSMathFloor, ExtOpJSMathCeil, ExtOpJSMathRound, ExtOpJSMathSqrt, ExtOpJSMathMin, ExtOpJSMathMax,
+			case ExtOpAxonASP, ExtOpJSMathSin, ExtOpJSMathCos, ExtOpJSMathTan, ExtOpJSMathAbs, ExtOpJSMathFloor, ExtOpJSMathCeil, ExtOpJSMathRound, ExtOpJSMathSqrt, ExtOpJSMathMin, ExtOpJSMathMax, ExtOpJSMathPow,
 				ExtOpFileOpen, ExtOpFileClose, ExtOpFileLineInput, ExtOpFilePut, ExtOpFileGet, ExtOpFileFreeFile,
-				ExtOpJSReThrow, ExtOpCloneRecord, ExtOpShiftLeft, ExtOpShiftRight:
+				ExtOpJSReThrow, ExtOpCloneRecord, ExtOpShiftLeft, ExtOpShiftRight, ExtOpJSWrite:
 				// No operands to remap or skip
 			case ExtOpFilePrint, ExtOpFileWrite:
 				ip += 2
@@ -1614,7 +1620,7 @@ func (vm *VM) cloneForExecuteLocal(startIP int) *VM {
 		}
 		bindings := make(map[string]Value, len(env.bindings))
 		maps.Copy(bindings, env.bindings)
-		child.jsEnvItems[id] = &jsEnvFrame{parentID: env.parentID, bindings: bindings}
+		child.jsEnvItems[id] = &jsEnvFrame{parentID: env.parentID, bindings: bindings, capturedClosures: env.capturedClosures, argumentsObjID: env.argumentsObjID}
 	}
 	child.jsArgumentsItems = make(map[int64]*jsArgumentsBinding, len(vm.jsArgumentsItems))
 	for id, binding := range vm.jsArgumentsItems {
@@ -1674,6 +1680,36 @@ func (vm *VM) cloneForExecuteLocal(startIP int) *VM {
 	child.jsErrStack = make([]Value, 0, 4)
 	// stmtSP carries over from parent; child's first OpLine will reset it.
 
+	return &child
+}
+
+// cloneForExecuteLocalSharedRuntime creates the synchronous Eval/Function
+// execution context. The parent VM is suspended while this child runs, so the
+// dynamic program can share its object and lexical-environment maps directly.
+// Deep-copying those maps for every eval is prohibitively expensive in large
+// Classic ASP pages because it copies every previously created JScript object.
+func (vm *VM) cloneForExecuteLocalSharedRuntime(startIP int) *VM {
+	vm.cloneForExecuteLocalCount++
+	child := *vm
+	child.parentVM = vm
+	child.stack = make([]Value, len(vm.stack))
+	copy(child.stack, vm.stack)
+	child.jsCallStack = make([]jsCallFrame, len(vm.jsCallStack))
+	copy(child.jsCallStack, vm.jsCallStack)
+	child.globalTypes = append([]ValueType(nil), vm.globalTypes...)
+	child.ip = startIP
+	child.callStack = append([]CallFrame(nil), vm.callStack...)
+	child.activeClassObjectID = vm.activeClassObjectID
+	child.terminateCursor = -1
+	child.terminatePrepared = false
+	child.suppressTerminate = true
+	child.onResumeNext = vm.onResumeNext
+	child.skipToNextStmt = false
+	child.jsTryStack = make([]int, 0, 8)
+	child.jsErrStack = make([]Value, 0, 4)
+	if len(vm.icState) > 0 {
+		child.icState = append([]InlineCacheSlot(nil), vm.icState...)
+	}
 	return &child
 }
 
@@ -1786,6 +1822,7 @@ func (vm *VM) syncExecuteGlobalState(child *VM) {
 	vm.nativeObjectProxies = child.nativeObjectProxies
 	vm.jsObjectItems = child.jsObjectItems
 	vm.jsObjectKeyOrder = child.jsObjectKeyOrder
+	vm.jsObjectKeySet = child.jsObjectKeySet
 	vm.jsObjectStateItems = child.jsObjectStateItems
 	vm.jsPropertyItems = child.jsPropertyItems
 	vm.jsFunctionItems = child.jsFunctionItems
@@ -1993,6 +2030,13 @@ func (vm *VM) Run() (err error) {
 		vm.stringWorkBuffer = vm.stringWorkBuffer[:0]
 	}
 
+	// Ensure the JScript root environment is initialized before any JScript
+	// bytecode executes. Without this, JScript builtins such as String(),
+	// Number(), Boolean(), Array(), Date(), etc. would resolve to their
+	// VBScript counterparts (VTBuiltin) instead of the correct JScript
+	// intrinsic objects, breaking fundamental type conversion functions.
+	vm.ensureJSRootEnv()
+
 aspExecLoop:
 	for vm.ip < len(vm.bytecode) {
 		operationCount++
@@ -2074,15 +2118,14 @@ aspExecLoop:
 				vm.bindWithEvents(nil, vm.globalNames[idx], newVal)
 			}
 
-			// Decrement reference count only for object slots to avoid hot-path call overhead.
-			if vm.Globals[idx].Type == VTObject {
-				vm.decrementObjectRefCount(vm.Globals[idx])
-			}
-			// Assign new value.
+			// Decrement reference count of previous value in this global slot.
+			prevVal := vm.Globals[idx]
 			vm.Globals[idx] = newVal
-			// Increment reference count only for object values to avoid hot-path call overhead.
 			if newVal.Type == VTObject {
 				vm.incrementObjectRefCount(newVal)
+			}
+			if prevVal.Type == VTObject {
+				vm.decrementObjectRefCount(prevVal)
 			}
 
 		case OpEraseGlobal:
@@ -2212,15 +2255,14 @@ aspExecLoop:
 			} else {
 				newVal.Interface = ""
 			}
-			// Decrement reference count only for object slots to avoid hot-path call overhead.
-			if vm.stack[slot].Type == VTObject {
-				vm.decrementObjectRefCount(vm.stack[slot])
-			}
-			// Assign new value.
+			// Decrement reference count of previous value in this local slot.
+			prevVal := vm.stack[slot]
 			vm.stack[slot] = newVal
-			// Increment reference count only for object values to avoid hot-path call overhead.
 			if newVal.Type == VTObject {
 				vm.incrementObjectRefCount(newVal)
+			}
+			if prevVal.Type == VTObject {
+				vm.decrementObjectRefCount(prevVal)
 			}
 
 		case OpEraseLocal:
@@ -2368,12 +2410,13 @@ aspExecLoop:
 						}
 					}
 				}
-				if vm.Globals[destIdx].Type == VTObject {
-					vm.decrementObjectRefCount(vm.Globals[destIdx])
-				}
+				prevVal := vm.Globals[destIdx]
 				vm.Globals[destIdx] = newVal
 				if newVal.Type == VTObject {
 					vm.incrementObjectRefCount(newVal)
+				}
+				if prevVal.Type == VTObject {
+					vm.decrementObjectRefCount(prevVal)
 				}
 			} else if destOp == OpSetLocal {
 				slot := vm.fp + int(destIdx)
@@ -2395,12 +2438,13 @@ aspExecLoop:
 						}
 					}
 				}
-				if vm.stack[slot].Type == VTObject {
-					vm.decrementObjectRefCount(vm.stack[slot])
-				}
+				prevVal := vm.stack[slot]
 				vm.stack[slot] = newVal
 				if newVal.Type == VTObject {
 					vm.incrementObjectRefCount(newVal)
+				}
+				if prevVal.Type == VTObject {
+					vm.decrementObjectRefCount(prevVal)
 				}
 			} else {
 				vm.raise(vbscript.InternalError, "Invalid OpSet destination")
@@ -2461,12 +2505,13 @@ aspExecLoop:
 				vm.Globals[idx] = current
 			default:
 				next := vm.addValues(current, NewInteger(1))
-				if current.Type == VTObject {
-					vm.decrementObjectRefCount(current)
-				}
+				prevVal := vm.Globals[idx]
 				vm.Globals[idx] = next
 				if next.Type == VTObject {
 					vm.incrementObjectRefCount(next)
+				}
+				if prevVal.Type == VTObject {
+					vm.decrementObjectRefCount(prevVal)
 				}
 			}
 
@@ -2483,12 +2528,13 @@ aspExecLoop:
 				vm.Globals[idx] = current
 			default:
 				next := vm.subtractValues(current, NewInteger(1))
-				if current.Type == VTObject {
-					vm.decrementObjectRefCount(current)
-				}
+				prevVal := vm.Globals[idx]
 				vm.Globals[idx] = next
 				if next.Type == VTObject {
 					vm.incrementObjectRefCount(next)
+				}
+				if prevVal.Type == VTObject {
+					vm.decrementObjectRefCount(prevVal)
 				}
 			}
 
@@ -2725,7 +2771,8 @@ aspExecLoop:
 			vm.sp--
 
 		case OpMathSin:
-			arg := resolveCallable(vm, vm.stack[vm.sp])
+			// Math intrinsics read by value; dereference any ByRef (VTArgRef) slot reference.
+			arg := vm.unwrapArgRefValue(vm.stack[vm.sp])
 			input := float64(arg.Num)
 			if arg.Type == VTDouble {
 				input = arg.Flt
@@ -2733,7 +2780,7 @@ aspExecLoop:
 			vm.stack[vm.sp] = NewDouble(math.Sin(input))
 
 		case OpMathCos:
-			arg := resolveCallable(vm, vm.stack[vm.sp])
+			arg := vm.unwrapArgRefValue(vm.stack[vm.sp])
 			input := float64(arg.Num)
 			if arg.Type == VTDouble {
 				input = arg.Flt
@@ -2741,7 +2788,7 @@ aspExecLoop:
 			vm.stack[vm.sp] = NewDouble(math.Cos(input))
 
 		case OpMathTan:
-			arg := resolveCallable(vm, vm.stack[vm.sp])
+			arg := vm.unwrapArgRefValue(vm.stack[vm.sp])
 			input := float64(arg.Num)
 			if arg.Type == VTDouble {
 				input = arg.Flt
@@ -2749,7 +2796,7 @@ aspExecLoop:
 			vm.stack[vm.sp] = NewDouble(math.Tan(input))
 
 		case OpMathAtn:
-			arg := resolveCallable(vm, vm.stack[vm.sp])
+			arg := vm.unwrapArgRefValue(vm.stack[vm.sp])
 			input := float64(arg.Num)
 			if arg.Type == VTDouble {
 				input = arg.Flt
@@ -2757,7 +2804,7 @@ aspExecLoop:
 			vm.stack[vm.sp] = NewDouble(math.Atan(input))
 
 		case OpMathSqr:
-			arg := resolveCallable(vm, vm.stack[vm.sp])
+			arg := vm.unwrapArgRefValue(vm.stack[vm.sp])
 			input := float64(arg.Num)
 			if arg.Type == VTDouble {
 				input = arg.Flt
@@ -2765,7 +2812,7 @@ aspExecLoop:
 			vm.stack[vm.sp] = NewDouble(math.Sqrt(input))
 
 		case OpMathAbs:
-			arg := resolveCallable(vm, vm.stack[vm.sp])
+			arg := vm.unwrapArgRefValue(vm.stack[vm.sp])
 			if arg.Type == VTDouble {
 				vm.stack[vm.sp] = NewDouble(math.Abs(arg.Flt))
 			} else {
@@ -2777,7 +2824,7 @@ aspExecLoop:
 			}
 
 		case OpMathExp:
-			arg := resolveCallable(vm, vm.stack[vm.sp])
+			arg := vm.unwrapArgRefValue(vm.stack[vm.sp])
 			input := float64(arg.Num)
 			if arg.Type == VTDouble {
 				input = arg.Flt
@@ -2785,7 +2832,7 @@ aspExecLoop:
 			vm.stack[vm.sp] = NewDouble(math.Exp(input))
 
 		case OpMathLog:
-			arg := resolveCallable(vm, vm.stack[vm.sp])
+			arg := vm.unwrapArgRefValue(vm.stack[vm.sp])
 			input := float64(arg.Num)
 			if arg.Type == VTDouble {
 				input = arg.Flt
@@ -2793,7 +2840,7 @@ aspExecLoop:
 			vm.stack[vm.sp] = NewDouble(math.Log(input))
 
 		case OpMathRound:
-			arg := resolveCallable(vm, vm.stack[vm.sp])
+			arg := vm.unwrapArgRefValue(vm.stack[vm.sp])
 			input := float64(arg.Num)
 			if arg.Type == VTDouble {
 				input = arg.Flt
@@ -2801,7 +2848,7 @@ aspExecLoop:
 			vm.stack[vm.sp] = NewDouble(math.RoundToEven(input))
 
 		case OpMathInt:
-			arg := resolveCallable(vm, vm.stack[vm.sp])
+			arg := vm.unwrapArgRefValue(vm.stack[vm.sp])
 			input := float64(arg.Num)
 			if arg.Type == VTDouble {
 				input = arg.Flt
@@ -3887,6 +3934,11 @@ aspExecLoop:
 				a := vm.jsToNumber(vm.pop()).Flt
 				vm.push(NewDouble(math.Max(a, b)))
 
+			case ExtOpJSMathPow:
+				exp := vm.jsToNumber(vm.pop()).Flt
+				base := vm.jsToNumber(vm.pop()).Flt
+				vm.push(NewDouble(math.Pow(base, exp)))
+
 			case ExtOpCloneRecord:
 				val := vm.pop()
 				if val.Type == VTRecord {
@@ -3923,6 +3975,12 @@ aspExecLoop:
 					vm.push(NewInteger(0))
 				} else {
 					vm.push(NewInteger(int64(val >> shift)))
+				}
+
+			case ExtOpJSWrite:
+				value := vm.pop()
+				if vm.output != nil {
+					_, _ = io.WriteString(vm.output, vm.valueToResponseString(value))
 				}
 
 			default:
@@ -4276,35 +4334,7 @@ aspExecLoop:
 				continue
 			}
 
-			isPrivateConstructor := false
-			classDef, exists := vm.runtimeClasses[strings.ToLower(strings.TrimSpace(instance.Str))]
-			if exists && classDef.Methods != nil {
-				if initMethod, ok := classDef.Methods["class_initialize"]; ok {
-					if !initMethod.IsPublic {
-						isPrivateConstructor = true
-					}
-				}
-			}
-
-			isInternal := false
-			if isPrivateConstructor {
-				if len(vm.callStack) > 0 {
-					callerFrame := vm.callStack[len(vm.callStack)-1]
-					if callerFrame.boundObj != 0 {
-						if callerInstance, ok := vm.runtimeClassItems[callerFrame.boundObj]; ok {
-							if strings.EqualFold(callerInstance.ClassName, instance.Str) {
-								isInternal = true
-							}
-						}
-					}
-				}
-			}
-
-			if isPrivateConstructor && !isInternal {
-				vm.push(Value{Type: VTEmpty})
-			} else {
-				vm.push(instance)
-			}
+			vm.push(instance)
 
 			initializerTarget, ok := vm.resolveRuntimeClassMethod(instance, "Class_Initialize", false)
 			if ok {
@@ -4312,14 +4342,8 @@ aspExecLoop:
 					vm.raise(vbscript.ClassInitializeOrTerminateDoNotHaveArguments, "Class_Initialize must not declare arguments")
 				}
 				if vm.beginUserSubCall(initializerTarget, nil, true, instance.Num) {
-					if isPrivateConstructor && !isInternal {
-						vm.callStack[len(vm.callStack)-1].throwObjectNotSet = true
-					}
 					continue
 				}
-			} else if isPrivateConstructor && !isInternal {
-				vm.raise(vbscript.ObjectVariableNotSet, "Object variable or With block variable not set")
-				continue
 			}
 
 		case OpJSDeclareName:
@@ -4556,6 +4580,13 @@ aspExecLoop:
 			target := vm.pop()
 			member := vm.constants[nameIdx].Str
 			stackLen := len(vm.jsCallStack)
+			if (target.Type == VTJSObject || target.Type == VTJSFunction) && vm.jsObjectStringProperty(target, "__js_type") == "" {
+				if callee, thisVal, ok, deferred := vm.jsPrepareMemberCallee(target, member); deferred {
+					continue
+				} else if ok && vm.jsBeginDirectCall(callee, thisVal, args) {
+					continue
+				}
+			}
 			if result, handled := vm.jsCallMember(target, member, args); handled {
 				if len(vm.jsCallStack) == stackLen || result.Type != VTJSUndefined {
 					vm.push(result)
@@ -4575,6 +4606,13 @@ aspExecLoop:
 			target := vm.pop()
 			key := vm.jsPropertyKeyFromValue(keyVal)
 			stackLen := len(vm.jsCallStack)
+			if (target.Type == VTJSObject || target.Type == VTJSFunction) && vm.jsObjectStringProperty(target, "__js_type") == "" {
+				if callee, thisVal, ok, deferred := vm.jsPrepareMemberCallee(target, key); deferred {
+					continue
+				} else if ok && vm.jsBeginDirectCall(callee, thisVal, args) {
+					continue
+				}
+			}
 			if result, handled := vm.jsCallMember(target, key, args); handled {
 				if len(vm.jsCallStack) == stackLen || result.Type != VTJSUndefined {
 					vm.push(result)
@@ -4594,6 +4632,15 @@ aspExecLoop:
 			}
 			target := vm.pop()
 			member := vm.constants[nameIdx].Str
+			// Function.prototype.call/apply are dispatch helpers, not ordinary
+			// callees. Resolve them before tail-call preparation so the wrapped
+			// function's return value is propagated to the current caller.
+			if target.Type == VTJSFunction && (strings.EqualFold(member, "call") || strings.EqualFold(member, "apply")) {
+				if result, handled := vm.jsCallMember(target, member, args); handled {
+					vm.jsReturn(result)
+					continue
+				}
+			}
 			if callee, thisVal, ok, deferred := vm.jsPrepareMemberCallee(target, member); deferred {
 				vm.jsReturn(Value{Type: VTJSUndefined})
 			} else if ok {
@@ -5052,7 +5099,7 @@ aspExecLoop:
 		case OpJSForInCleanup:
 			forInPos := int(binary.BigEndian.Uint32(vm.bytecode[vm.ip:]))
 			vm.ip += 4
-			delete(vm.jsForInItems, forInPos)
+			delete(vm.jsForInItems, jsLoopEnumeratorKey{opPos: forInPos, envID: vm.jsActiveEnvID})
 			if vm.sp >= 0 {
 				vm.pop()
 			}
@@ -5064,7 +5111,8 @@ aspExecLoop:
 			vm.ip += 4
 
 			opPos := vm.ip - 7
-			enumState := vm.jsForInItems[opPos]
+			enumKey := jsLoopEnumeratorKey{opPos: opPos, envID: vm.jsActiveEnvID}
+			enumState := vm.jsForInItems[enumKey]
 			if enumState == nil {
 				if vm.sp < 0 {
 					vm.ip = exitTarget
@@ -5073,11 +5121,11 @@ aspExecLoop:
 				source := vm.stack[vm.sp]
 				keys := vm.jsEnumerateForInKeys(source)
 				enumState = &jsForInEnumerator{keys: keys, index: 0}
-				vm.jsForInItems[opPos] = enumState
+				vm.jsForInItems[enumKey] = enumState
 			}
 
 			if enumState.index >= len(enumState.keys) {
-				delete(vm.jsForInItems, opPos)
+				delete(vm.jsForInItems, enumKey)
 				if vm.sp >= 0 {
 					vm.pop()
 				}
@@ -5092,7 +5140,7 @@ aspExecLoop:
 			// Remove stale for-of enumerator on early exit (break/throw).
 			forOfPos := int(binary.BigEndian.Uint32(vm.bytecode[vm.ip:]))
 			vm.ip += 4
-			delete(vm.jsForOfItems, forOfPos)
+			delete(vm.jsForOfItems, jsLoopEnumeratorKey{opPos: forOfPos, envID: vm.jsActiveEnvID})
 			if vm.sp >= 0 {
 				vm.pop()
 			}
@@ -5106,7 +5154,8 @@ aspExecLoop:
 			vm.ip += 4
 
 			opPos := vm.ip - 7
-			foState := vm.jsForOfItems[opPos]
+			foKey := jsLoopEnumeratorKey{opPos: opPos, envID: vm.jsActiveEnvID}
+			foState := vm.jsForOfItems[foKey]
 			if foState == nil {
 				// First encounter: collect iterable values and pop the source.
 				if vm.sp < 0 {
@@ -5116,12 +5165,12 @@ aspExecLoop:
 				source := vm.stack[vm.sp]
 				values := vm.jsEnumerateForOfValues(source)
 				foState = &jsForOfEnumerator{values: values, index: 0}
-				vm.jsForOfItems[opPos] = foState
+				vm.jsForOfItems[foKey] = foState
 			}
 
 			if foState.index >= len(foState.values) {
 				// Exhausted: clean up and jump past the loop.
-				delete(vm.jsForOfItems, opPos)
+				delete(vm.jsForOfItems, foKey)
 				if vm.sp >= 0 {
 					vm.pop()
 				}
@@ -5646,7 +5695,7 @@ aspExecLoop:
 			nameIdx := binary.BigEndian.Uint16(vm.bytecode[vm.ip:])
 			vm.ip += 2
 			name := vm.constants[nameIdx].Str
-			for i := len(vm.jsBlockScopes) - 1; i >= 0; i-- {
+			for i := range slices.Backward(vm.jsBlockScopes) {
 				if _, inTDZ := vm.jsBlockScopeTDZ[i][name]; inTDZ {
 					delete(vm.jsBlockScopeTDZ[i], name)
 					break
@@ -5660,14 +5709,14 @@ aspExecLoop:
 			name := vm.constants[nameIdx].Str
 			val := vm.pop()
 			// Find the innermost block scope that has this const name and is still in TDZ
-			for i := len(vm.jsBlockScopes) - 1; i >= 0; i-- {
+			for i, v := range slices.Backward(vm.jsBlockScopes) {
 				if _, inTDZ := vm.jsBlockScopeTDZ[i][name]; inTDZ {
-					vm.jsBlockScopes[i][name] = val
+					v[name] = val
 					delete(vm.jsBlockScopeTDZ[i], name)
 					break
 				}
-				if _, exists := vm.jsBlockScopes[i][name]; exists {
-					vm.jsBlockScopes[i][name] = val
+				if _, exists := v[name]; exists {
+					v[name] = val
 					break
 				}
 			}
@@ -5738,9 +5787,15 @@ aspExecLoop:
 			frame := vm.callStack[len(vm.callStack)-1]
 			vm.callStack = vm.callStack[:len(vm.callStack)-1]
 
-			// Decrement reference counts for all local variables going out of scope.
-			for i := vm.fp; i <= vm.sp; i++ {
-				vm.decrementObjectRefCount(vm.stack[i])
+			// If this call frame was for Class_Terminate, release member values now that Class_Terminate has finished.
+			if frame.terminateObjID != 0 {
+				if instance, ok := vm.runtimeClassItems[frame.terminateObjID]; ok && instance != nil {
+					members := instance.Members
+					instance.Members = nil
+					for _, val := range members {
+						vm.decrementObjectRefCount(val)
+					}
+				}
 			}
 
 			// ByRef write-back: read callee's param values before restoring fp/sp.
@@ -5764,6 +5819,25 @@ aspExecLoop:
 					}
 				}
 			}
+
+			// Collect local variables going out of scope before restoring caller frame.
+			calleeFP := vm.fp
+			calleeSP := vm.sp
+			if frame.callee.Type == VTUserSub {
+				localCount := max(frame.callee.UserSubLocalCount(), frame.callee.UserSubParamCount())
+				calleeSP = max(calleeFP+localCount-1, calleeSP)
+			}
+
+			var exitingLocals []Value
+			for i := calleeFP; i <= calleeSP; i++ {
+				if i >= 0 && i < StackSize {
+					if vm.stack[i].Type == VTObject {
+						exitingLocals = append(exitingLocals, vm.stack[i])
+					}
+					vm.stack[i] = Value{Type: VTEmpty}
+				}
+			}
+
 			vm.sp = frame.oldSP
 			vm.fp = frame.oldFP
 			vm.ip = frame.returnIP
@@ -5777,9 +5851,11 @@ aspExecLoop:
 			if !frame.discard {
 				vm.push(retVal)
 			}
-			if frame.throwObjectNotSet {
-				vm.raise(vbscript.ObjectVariableNotSet, "Object variable or With block variable not set")
-				continue
+
+			// Decrement reference counts for all local variables going out of scope.
+			for _, val := range exitingLocals {
+				isRetVal := !frame.discard && retVal.Type == VTObject && val.Type == VTObject && val.Num == retVal.Num
+				vm.decrementObjectRefCountEx(val, isRetVal)
 			}
 
 		case OpSwap:
@@ -5809,7 +5885,7 @@ aspExecLoop:
 		vm.jsProcessMicrotasks()
 	}
 
-	if vm.host != nil && vm.host.Response() != nil {
+	if vm.host != nil && vm.host.Response() != nil && isRootRun {
 		vm.host.Response().Flush()
 	}
 
@@ -6361,6 +6437,16 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		return consoleDispatch(vm, member, args)
 	}
 
+	// emptyForCtx returns the appropriate empty value depending on the execution context.
+	// In JScript/JavaScript mode, missing members return an empty string ("") to match
+	// browser/JavaScript semantics. In VBScript mode, they return VTEmpty.
+	emptyForCtx := func() Value {
+		if vm.engineMode == EngineModeJavaScript || len(vm.jsCallStack) > 0 || vm.jsActiveEnvID != 0 || vm.jsRootEnvID != 0 {
+			return NewString("")
+		}
+		return Value{Type: VTEmpty}
+	}
+
 	switch objID {
 	case nativeObjectResponse: // Response
 		response := vm.host.Response()
@@ -6589,50 +6675,84 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		switch {
 		case member == "":
 			if len(args) >= 1 {
-				return NewString(request.GetValue(args[0].String()))
-			}
-			return Value{Type: VTEmpty}
-		case strings.EqualFold(member, "QueryString"):
-			if len(args) >= 1 {
-				if value, ok := request.QueryString.GetValue(args[0].String()); ok {
+				key := args[0].String()
+				if value, ok := request.QueryString.GetValue(key); ok {
 					return vm.newRequestCollectionValueItem(value)
 				}
-				return Value{Type: VTEmpty}
+				if !request.IsBinaryReadUsed() {
+					request.MarkFormUsed()
+					if value, ok := request.Form.GetValue(key); ok {
+						return vm.newRequestCollectionValueItem(value)
+					}
+				}
+				if value, ok := request.Cookies.GetValue(key); ok {
+					return vm.newRequestCollectionValueItem(value)
+				}
+				if value, ok := request.ClientCertificate.GetValue(key); ok {
+					return vm.newRequestCollectionValueItem(value)
+				}
+				if value, ok := request.ServerVars.GetValue(key); ok {
+					return vm.newRequestCollectionValueItem(value)
+				}
+				// Request("missing") is still an IIS Request collection value.
+				// Preserve that distinction so string coercion yields "" while
+				// numeric JScript coercion yields NaN rather than zero.
+				return vm.newRequestCollectionValueItem(asp.RequestCollectionValue{})
 			}
-			return Value{Type: VTEmpty}
+			return emptyForCtx()
+		case strings.EqualFold(member, "QueryString"):
+			if len(args) >= 1 {
+				if value, ok := request.QueryString.GetSelectedValue(args[0].String()); ok {
+					return vm.newRequestCollectionValueItem(value)
+				}
+				return emptyForCtx()
+			}
+			return emptyForCtx()
 		case strings.EqualFold(member, "Form"):
 			if len(args) >= 1 {
 				if request.IsBinaryReadUsed() {
-					return Value{Type: VTEmpty}
+					return emptyForCtx()
 				}
 				request.MarkFormUsed()
-				if value, ok := request.Form.GetValue(args[0].String()); ok {
+				if value, ok := request.Form.GetSelectedValue(args[0].String()); ok {
 					return vm.newRequestCollectionValueItem(value)
 				}
-				return Value{Type: VTEmpty}
+				return emptyForCtx()
 			}
-			return Value{Type: VTEmpty}
+			return emptyForCtx()
 		case strings.EqualFold(member, "Cookies"):
 			if len(args) == 1 {
-				if value, ok := request.Cookies.GetValue(args[0].String()); ok {
+				if value, ok := request.Cookies.GetSelectedValue(args[0].String()); ok {
 					return vm.newRequestCollectionValueItem(value)
 				}
-				return Value{Type: VTEmpty}
+				return emptyForCtx()
 			}
 			if len(args) >= 2 {
 				return NewString(request.GetCookieAttribute(args[0].String(), args[1].String()))
 			}
-			return Value{Type: VTEmpty}
+			return emptyForCtx()
 		case strings.EqualFold(member, "ServerVariables"):
 			if len(args) >= 1 {
-				return NewString(request.GetCollectionValue("ServerVariables", args[0].String()))
+				if value, ok := request.ServerVars.GetSelectedValue(args[0].String()); ok {
+					return vm.newRequestCollectionValueItem(value)
+				}
+				if vm.engineMode == EngineModeJavaScript {
+					return Value{Type: VTJSUndefined}
+				}
+				return Value{Type: VTEmpty}
 			}
-			return Value{Type: VTEmpty}
+			return Value{Type: VTNativeObject, Num: nativeRequestServerVariables}
 		case strings.EqualFold(member, "ClientCertificate"):
 			if len(args) >= 1 {
-				return NewString(request.GetCollectionValue("ClientCertificate", args[0].String()))
+				if value, ok := request.ClientCertificate.GetSelectedValue(args[0].String()); ok {
+					return vm.newRequestCollectionValueItem(value)
+				}
+				if vm.engineMode == EngineModeJavaScript {
+					return Value{Type: VTJSUndefined}
+				}
+				return Value{Type: VTEmpty}
 			}
-			return Value{Type: VTEmpty}
+			return Value{Type: VTNativeObject, Num: nativeRequestClientCertificate}
 		case strings.EqualFold(member, "TotalBytes"):
 			return NewInteger(request.TotalBytes())
 		case strings.EqualFold(member, "BinaryRead"):
@@ -6704,7 +6824,7 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		}
 	case nativeRequestQueryString:
 		if (member == "" || strings.EqualFold(member, "Item")) && len(args) >= 1 {
-			value, _ := vm.host.Request().QueryString.GetValue(args[0].String())
+			value, _ := vm.host.Request().QueryString.GetSelectedValue(args[0].String())
 			return vm.newRequestCollectionValueItem(value)
 		}
 		if strings.EqualFold(member, "Count") {
@@ -6720,7 +6840,7 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 				return vm.newRequestCollectionValueItem(asp.RequestCollectionValue{})
 			}
 			vm.host.Request().MarkFormUsed()
-			value, _ := vm.host.Request().Form.GetValue(args[0].String())
+			value, _ := vm.host.Request().Form.GetSelectedValue(args[0].String())
 			return vm.newRequestCollectionValueItem(value)
 		}
 		if strings.EqualFold(member, "Count") {
@@ -6740,7 +6860,7 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		return Value{Type: VTEmpty}
 	case nativeRequestCookies:
 		if (member == "" || strings.EqualFold(member, "Item")) && len(args) == 1 {
-			value, _ := vm.host.Request().Cookies.GetValue(args[0].String())
+			value, _ := vm.host.Request().Cookies.GetSelectedValue(args[0].String())
 			return vm.newRequestCollectionValueItem(value)
 		}
 		if (member == "" || strings.EqualFold(member, "Item")) && len(args) >= 2 {
@@ -6755,8 +6875,13 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		return Value{Type: VTEmpty}
 	case nativeRequestServerVariables:
 		if (member == "" || strings.EqualFold(member, "Item")) && len(args) >= 1 {
-			value, _ := vm.host.Request().ServerVars.GetValue(args[0].String())
-			return vm.newRequestCollectionValueItem(value)
+			if value, ok := vm.host.Request().ServerVars.GetSelectedValue(args[0].String()); ok {
+				return vm.newRequestCollectionValueItem(value)
+			}
+			if vm.engineMode == EngineModeJavaScript {
+				return Value{Type: VTJSUndefined}
+			}
+			return Value{Type: VTEmpty}
 		}
 		if strings.EqualFold(member, "Count") {
 			return NewInteger(int64(vm.host.Request().ServerVars.Count()))
@@ -6767,8 +6892,13 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		return Value{Type: VTEmpty}
 	case nativeRequestClientCertificate:
 		if (member == "" || strings.EqualFold(member, "Item")) && len(args) >= 1 {
-			value, _ := vm.host.Request().ClientCertificate.GetValue(args[0].String())
-			return vm.newRequestCollectionValueItem(value)
+			if value, ok := vm.host.Request().ClientCertificate.GetSelectedValue(args[0].String()); ok {
+				return vm.newRequestCollectionValueItem(value)
+			}
+			if vm.engineMode == EngineModeJavaScript {
+				return Value{Type: VTJSUndefined}
+			}
+			return Value{Type: VTEmpty}
 		}
 		if strings.EqualFold(member, "Count") {
 			return NewInteger(int64(vm.host.Request().ClientCertificate.Count()))
@@ -6836,7 +6966,16 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 			return NewString("")
 		case strings.EqualFold(member, "MapPath"):
 			if len(args) >= 1 {
-				return NewString(server.MapPath(args[0].String()))
+				path := args[0].String()
+				if !filepath.IsAbs(path) && !strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "\\") {
+					if sourceFile, _ := vm.mappedCurrentLocation(); strings.TrimSpace(sourceFile) != "" {
+						virtualSource := server.VirtualPathFromAbsolutePath(sourceFile)
+						if virtualSource != "" {
+							path = filepath.ToSlash(filepath.Join(filepath.Dir(virtualSource), path))
+						}
+					}
+				}
+				return NewString(server.MapPath(path))
 			}
 			return NewString(server.MapPath(""))
 		case strings.EqualFold(member, "IsClientConnected"):
@@ -7344,6 +7483,11 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 			return Value{Type: VTEmpty}
 		case strings.EqualFold(member, "Count"):
 			return NewInteger(int64(session.Count()))
+		case strings.EqualFold(member, "Key"):
+			if len(args) >= 1 {
+				return vm.sessionContentsKey(args[0])
+			}
+			return NewString("")
 		case strings.EqualFold(member, "Keys"):
 			keys := session.GetAllKeys()
 			sort.Strings(keys)
@@ -7405,6 +7549,11 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 			return Value{Type: VTEmpty}
 		case strings.EqualFold(member, "Count"):
 			return NewInteger(int64(len(application.GetContentsCopy())))
+		case strings.EqualFold(member, "Key"):
+			if len(args) >= 1 {
+				return vm.applicationContentsKey(args[0])
+			}
+			return NewString("")
 		case strings.EqualFold(member, "Keys"):
 			contents := application.GetContentsCopy()
 			keys := make([]string, 0, len(contents))
@@ -7452,13 +7601,7 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		}
 	case nativeObjectSessionContentsKeyMethod:
 		if member == "" && len(args) >= 1 {
-			idx := vm.asInt(args[0]) - 1
-			keys := vm.host.Session().GetAllKeys()
-			sort.Strings(keys)
-			if idx >= 0 && idx < len(keys) {
-				return NewString(keys[idx])
-			}
-			return NewString("")
+			return vm.sessionContentsKey(args[0])
 		}
 		return NewString("")
 	case nativeObjectSessionStaticObjectsKeyMethod:
@@ -7478,17 +7621,7 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		return NewString("")
 	case nativeObjectApplicationContentsKeyMethod:
 		if member == "" && len(args) >= 1 {
-			idx := vm.asInt(args[0]) - 1
-			contents := vm.host.Application().GetContentsCopy()
-			keys := make([]string, 0, len(contents))
-			for k := range contents {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			if idx >= 0 && idx < len(keys) {
-				return NewString(keys[idx])
-			}
-			return NewString("")
+			return vm.applicationContentsKey(args[0])
 		}
 		return NewString("")
 	case nativeObjectApplicationStaticObjectsKeyMethod:
@@ -7520,6 +7653,30 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		}
 	}
 	return Value{Type: VTEmpty}
+}
+
+func (vm *VM) sessionContentsKey(index Value) Value {
+	idx := vm.asInt(index) - 1
+	keys := vm.host.Session().GetAllKeys()
+	sort.Strings(keys)
+	if idx >= 0 && idx < len(keys) {
+		return NewString(keys[idx])
+	}
+	return NewString("")
+}
+
+func (vm *VM) applicationContentsKey(index Value) Value {
+	idx := vm.asInt(index) - 1
+	contents := vm.host.Application().GetContentsCopy()
+	keys := make([]string, 0, len(contents))
+	for key := range contents {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	if idx >= 0 && idx < len(keys) {
+		return NewString(keys[idx])
+	}
+	return NewString("")
 }
 
 // dispatchMemberGet resolves chained member access on native objects.
@@ -7918,6 +8075,11 @@ func (vm *VM) dispatchMemberGet(target Value, member string) Value {
 		switch {
 		case strings.EqualFold(member, "ScriptTimeout"):
 			return NewInteger(int64(vm.host.Server().GetScriptTimeout()))
+		case strings.EqualFold(member, "GetLastError"):
+			// Bare VBScript access (Server.GetLastError without parentheses) compiles to
+			// OpMemberGet, so route it here to return the wrapped ASPError native object.
+			// Parenthesized calls reach dispatchNativeCall directly; both paths must agree.
+			return vm.newASPErrorObject(vm.host.Server().GetLastError())
 		}
 	case nativeObjectSessionContents:
 		session := vm.host.Session()
@@ -8342,12 +8504,6 @@ func (vm *VM) valueToString(v Value) string {
 			return vm.host.Response().GetCookieValue(cookieName)
 		}
 		if collectionValue, exists := vm.requestCollectionValueItems[v.Num]; exists {
-			if len(collectionValue.Values) == 0 {
-				isJS := len(vm.jsCallStack) > 0 || vm.jsActiveEnvID != 0 || vm.jsRootEnvID != 0 || len(vm.jsTryStack) > 0 || len(vm.jsErrStack) > 0 || vm.engineMode == EngineModeJavaScript
-				if isJS {
-					return "undefined"
-				}
-			}
 			return collectionValue.Joined()
 		}
 		if errObj, exists := vm.aspErrorItems[v.Num]; exists {
@@ -8389,12 +8545,25 @@ func (vm *VM) valueToString(v Value) string {
 // valueToResponseString applies Response.Write coercion rules for mixed VBScript/JScript values.
 func (vm *VM) valueToResponseString(v Value) string {
 	v = resolveCallable(vm, v)
+	// JScript ASP expression blocks use the JScript string conversion rules.
+	// SQL NULLs reach them as VTNull, which must render as "null" so legacy
+	// isNull helpers can recognize and replace the value.
+	if v.Type == VTNull && (vm.engineMode == EngineModeJavaScript || len(vm.jsCallStack) > 0 || vm.jsActiveEnvID != 0 || vm.jsRootEnvID != 0) {
+		return "null"
+	}
 	isJS := vm.engineMode == EngineModeJavaScript || len(vm.jsCallStack) > 0 || vm.jsActiveEnvID != 0 || vm.jsRootEnvID != 0
 	if !isJS {
 		return vm.valueToString(v)
 	}
 
 	switch v.Type {
+	case VTInteger:
+		if v.Num >= 1000000000000000 || v.Num <= -1000000000000000 {
+			return formatMicrosoftJScriptResponseDouble(float64(v.Num))
+		}
+		return strconv.FormatInt(v.Num, 10)
+	case VTDouble:
+		return formatMicrosoftJScriptResponseDouble(v.Flt)
 	case VTArray:
 		return vm.jsArrayToString(v)
 	case VTJSFunction:
@@ -8402,7 +8571,11 @@ func (vm *VM) valueToResponseString(v Value) string {
 			return vm.valueToString(out)
 		}
 		return vm.jsToString(v)
-	case VTJSProxy, VTJSUndefined:
+	case VTJSUndefined:
+		// Microsoft JScript writes undefined as an empty value through both
+		// Response.Write(undefined) and ASP expression blocks (<%= undefined %>).
+		return ""
+	case VTJSProxy:
 		return vm.jsToString(v)
 	case VTJSObject:
 		objType := vm.jsObjectStringProperty(v, "__js_type")
@@ -8419,6 +8592,50 @@ func (vm *VM) valueToResponseString(v Value) string {
 	default:
 		return vm.valueToString(v)
 	}
+}
+
+// formatMicrosoftJScriptResponseDouble reproduces the legacy numeric
+// formatting Microsoft JScript applies when Response.Write receives a Number
+// directly. Explicit String(number) and concatenation use normal ECMAScript
+// formatting instead.
+func formatMicrosoftJScriptResponseDouble(value float64) string {
+	if math.IsNaN(value) {
+		return "-1.#IND"
+	}
+	if math.IsInf(value, 1) {
+		return "1.#INF"
+	}
+	if math.IsInf(value, -1) {
+		return "-1.#INF"
+	}
+	if value == 0 {
+		return "0"
+	}
+
+	absValue := math.Abs(value)
+	if absValue >= 1e15 {
+		formatted := strconv.FormatFloat(value, 'E', 14, 64)
+		parts := strings.SplitN(formatted, "E", 2)
+		parts[0] = strings.TrimRight(strings.TrimRight(parts[0], "0"), ".")
+		exponent := parts[1]
+		sign := exponent[:1]
+		digits := strings.TrimLeft(exponent[1:], "0")
+		if digits == "" {
+			digits = "0"
+		}
+		return parts[0] + "E" + sign + digits
+	}
+
+	integerDigits := 0
+	if absValue >= 1 {
+		integerDigits = int(math.Floor(math.Log10(absValue))) + 1
+	}
+	decimalPlaces := 15 - integerDigits
+	if absValue < 1 {
+		decimalPlaces = 14 - int(math.Floor(math.Log10(absValue)))
+	}
+	formatted := strconv.FormatFloat(value, 'f', decimalPlaces, 64)
+	return strings.TrimRight(strings.TrimRight(formatted, "0"), ".")
 }
 
 // newRequestCollectionValueItem creates one native object wrapper for one Request collection entry value.
@@ -8669,8 +8886,8 @@ func (vm *VM) errRaise(args []Value) Value {
 		return Value{Type: VTEmpty}
 	}
 
-	for i := len(vm.callStack) - 1; i >= 0; i-- {
-		frame := vm.callStack[i]
+	for i, frame := range slices.Backward(vm.callStack) {
+
 		if !frame.savedOnResumeNext {
 			continue
 		}
@@ -8760,6 +8977,26 @@ func (vm *VM) valueToApplicationValue(v Value) asp.ApplicationValue {
 		return asp.NewApplicationString(v.Str)
 	case VTEmpty:
 		return asp.NewApplicationEmpty()
+	case VTNothing:
+		return asp.NewApplicationNothing()
+	case VTNativeObject:
+		if v.Num == 0 {
+			return asp.NewApplicationNothing()
+		}
+		return asp.NewApplicationNativeObject(v.Num, v.Str, v.Interface)
+	case VTObject:
+		if v.Num == 0 {
+			return asp.NewApplicationNothing()
+		}
+		return asp.NewApplicationObject(v.Num, v.Str, v.Interface)
+	case VTJSObject:
+		if v.Num == 0 {
+			return asp.NewApplicationNothing()
+		}
+		// Session and Application values outlive the VM that created them. A raw
+		// JScript object ID is only meaningful inside that VM, so retain a
+		// self-contained representation for later requests.
+		return asp.NewApplicationJSObject(0, vm.jsJSONStringify(v), "application/json")
 	case VTArray:
 		if v.Arr != nil {
 			return vm.vbArrayToApplicationValue(v.Arr)
@@ -8802,6 +9039,17 @@ func (vm *VM) applicationValueToValue(v asp.ApplicationValue) Value {
 			return vm.materializeStaticObjectFromMarker(v.Str)
 		}
 		return NewString(v.Str)
+	case asp.ApplicationValueNativeObject:
+		return Value{Type: VTNativeObject, Num: v.Num, Str: v.Str, Interface: v.Interface}
+	case asp.ApplicationValueObject:
+		return Value{Type: VTObject, Num: v.Num, Str: v.Str, Interface: v.Interface}
+	case asp.ApplicationValueJSObject:
+		if v.Interface == "application/json" && v.Str != "" {
+			return vm.jsJSONParse(v.Str)
+		}
+		return Value{Type: VTJSObject, Num: v.Num, Str: v.Str, Interface: v.Interface}
+	case asp.ApplicationValueNothing:
+		return Value{Type: VTNothing}
 	case asp.ApplicationValueArray:
 		return vm.applicationValueToVBArray(v)
 	default:
@@ -9155,11 +9403,15 @@ func (vm *VM) setClassMemberValueByObjectID(objectID int64, memberName string, v
 	instance.Members[strings.ToLower(strings.TrimSpace(memberName))] = value
 }
 
-// decrementObjectRefCount decrements the reference count of a VTObject and marks it
-// for termination if the count reaches zero. The actual Class_Terminate call will be
-// queued and executed during the next available opportunity in the VM loop.
+// decrementObjectRefCount decrements the reference count of a VTObject and executes
+// Class_Terminate synchronously if refCount reaches zero.
 func (vm *VM) decrementObjectRefCount(obj Value) {
-	if obj.Type != VTObject {
+	vm.decrementObjectRefCountEx(obj, false)
+}
+
+// decrementObjectRefCountEx decrements refCount and optionally protects active return values from premature termination.
+func (vm *VM) decrementObjectRefCountEx(obj Value, isReturnValue bool) {
+	if vm == nil || obj.Type != VTObject || vm.runtimeClassItems == nil {
 		return
 	}
 	instance, exists := vm.runtimeClassItems[obj.Num]
@@ -9172,15 +9424,43 @@ func (vm *VM) decrementObjectRefCount(obj Value) {
 	instance.refCount--
 	if instance.refCount <= 0 {
 		instance.refCount = 0 // Ensure non-negative for safety.
-		// Mark for termination; the actual termination will happen via
-		// prepareClassTerminateCall during cleanup or when explicitly triggered.
+		if isReturnValue {
+			return // Do not terminate or nullify Members when this object is the active return value being passed to caller.
+		}
 		instance.terminated = true
+
+		if !vm.suppressTerminate {
+			target, ok := vm.resolveRuntimeClassMethod(
+				Value{Type: VTObject, Num: obj.Num, Str: instance.ClassName},
+				"Class_Terminate",
+				false,
+			)
+			if ok {
+				if target.UserSubParamCount() != 0 {
+					vm.raise(vbscript.ClassInitializeOrTerminateDoNotHaveArguments, "Class_Terminate must not declare arguments")
+					return
+				}
+				if vm.beginUserSubCall(target, nil, true, obj.Num) {
+					if len(vm.callStack) > 0 {
+						vm.callStack[len(vm.callStack)-1].terminateObjID = obj.Num
+					}
+					return
+				}
+			}
+		}
+
+		// If no Class_Terminate or termination call not begun, release member values.
+		members := instance.Members
+		instance.Members = nil
+		for _, val := range members {
+			vm.decrementObjectRefCount(val)
+		}
 	}
 }
 
 // incrementObjectRefCount increments the reference count when a VTObject is assigned to a new slot.
 func (vm *VM) incrementObjectRefCount(obj Value) {
-	if obj.Type != VTObject {
+	if vm == nil || obj.Type != VTObject || vm.runtimeClassItems == nil {
 		return
 	}
 	instance, exists := vm.runtimeClassItems[obj.Num]
@@ -9608,14 +9888,22 @@ func (vm *VM) beginUserSubCall(target Value, args []Value, discardReturn bool, b
 
 		if argIdx < len(args) {
 			// Normal argument provided.
-			vm.stack[vm.fp+paramIdx] = args[argIdx]
+			argVal := args[argIdx]
+			vm.stack[vm.fp+paramIdx] = argVal
+			if argVal.Type == VTObject {
+				vm.incrementObjectRefCount(argVal)
+			}
 			argIdx++
 		} else if (optionalMask>>uint(paramIdx))&1 == 1 {
 			// Optional parameter with no argument provided - use default value.
 			if hasDefaults && paramIdx < len(defaults) && defaults[paramIdx] >= 0 {
 				defaultIdx := defaults[paramIdx]
 				if defaultIdx >= 0 && defaultIdx < len(vm.constants) {
-					vm.stack[vm.fp+paramIdx] = vm.constants[defaultIdx]
+					val := vm.constants[defaultIdx]
+					vm.stack[vm.fp+paramIdx] = val
+					if val.Type == VTObject {
+						vm.incrementObjectRefCount(val)
+					}
 				} else {
 					vm.stack[vm.fp+paramIdx] = Value{Type: VTEmpty}
 				}
@@ -9843,7 +10131,7 @@ func (vm *VM) newRuntimeClassInstance(className string) Value {
 		Members:         make(map[string]Value),
 		Observers:       make(map[string][]EventObserver),
 		WithEventsNames: make(map[string]bool),
-		refCount:        1, // Initial reference from creation
+		refCount:        0, // Initial reference count (incremented when assigned)
 		terminated:      false,
 	}
 	// Track creation order so Class_Terminate fires in reverse-construction order at cleanup.
@@ -9876,6 +10164,16 @@ func (vm *VM) newRuntimeClassInstance(className string) Value {
 
 func (vm *VM) pop() Value {
 	if vm.sp < 0 {
+		// A shared dispatch loop executes both VBScript and JScript bytecode.
+		// When the underflow surfaces while JScript state is active, route it
+		// through the JScript runtime error path so the host reports
+		// "JScript runtime error" (Category/Source) instead of mislabeling the
+		// fault as a VBScript runtime error. See the JScript-vs-VBScript error
+		// routing directive.
+		if len(vm.jsCallStack) > 0 || vm.jsActiveEnvID != 0 || vm.jsRootEnvID != 0 || len(vm.jsTryStack) > 0 || len(vm.jsErrStack) > 0 || vm.engineMode == EngineModeJavaScript {
+			vm.jsRaiseRuntimeError(jscript.InternalError, "Stack underflow")
+			return Value{Type: VTEmpty}
+		}
 		vm.raise(vbscript.InternalError, "Stack underflow")
 		return Value{Type: VTEmpty}
 	}
@@ -10154,6 +10452,9 @@ func parseFloat64(s string) (float64, error) {
 	return strconv.ParseFloat(s, 64)
 }
 
+// raise raises a runtime error exclusively for the VBScript runtime.
+// It formats the error with Category "VBScript runtime" and Source "VBScript runtime error".
+// For JScript runtime errors, DO NOT use this method; use vm.jsRaiseRuntimeError instead.
 func (vm *VM) raise(code vbscript.VBSyntaxErrorCode, msg string) {
 	description := strings.TrimSpace(msg)
 	if description == "" {
@@ -10184,24 +10485,6 @@ func (vm *VM) raise(code vbscript.VBSyntaxErrorCode, msg string) {
 func (vm *VM) raiseVMError(vme *VMError) {
 	vm.errSetFromVMError(vme)
 
-	isJS := len(vm.jsCallStack) > 0 || vm.jsActiveEnvID != 0 || vm.jsRootEnvID != 0 || len(vm.jsTryStack) > 0 || len(vm.jsErrStack) > 0 || vm.engineMode == EngineModeJavaScript
-	if isJS {
-		vm.lastError = vme
-		errObj := vm.jsCreateErrorObject("Error", vme.Msg)
-		vm.jsMemberSet(errObj, "number", NewInteger(int64(vme.Number)))
-		vm.jsMemberSet(errObj, "description", NewString(vme.Msg))
-		vm.jsMemberSet(errObj, "message", NewString(vme.Msg))
-
-		if len(vm.jsTryStack) > 0 {
-			target := vm.jsTryStack[len(vm.jsTryStack)-1]
-			vm.jsTryStack = vm.jsTryStack[:len(vm.jsTryStack)-1]
-			vm.jsErrStack = append(vm.jsErrStack, errObj)
-			vm.ip = target
-			return
-		}
-		panic(&jsAsyncRejectionError{reason: errObj})
-	}
-
 	if vm.onResumeNext || vm.executeGlobalResumeGuard {
 		vm.lastError = vme
 		vm.skipToNextStmt = true
@@ -10214,8 +10497,8 @@ func (vm *VM) raiseVMError(vme *VMError) {
 	// statement following the call that raised the error. This mirrors classic
 	// VBScript behaviour: an unhandled error propagates up until it reaches a
 	// procedure scope that has On Error Resume Next active.
-	for i := len(vm.callStack) - 1; i >= 0; i-- {
-		frame := vm.callStack[i]
+	for i, frame := range slices.Backward(vm.callStack) {
+
 		if !frame.savedOnResumeNext {
 			continue
 		}

@@ -49,7 +49,7 @@ import (
 	"sync"
 	"time"
 
-	"g3pix.com.br/axonasp/axonconfig"
+	"g3pix.com.br/axonasp/v2/axonconfig"
 	_ "github.com/denisenkom/go-mssqldb"
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
@@ -275,6 +275,14 @@ func (g *G3DB) open(driver, dsn string) bool {
 		_ = db.Close()
 		g.lastError = ErrG3DBPingFailed.String() + ": " + err.Error()
 		return false
+	}
+
+	// SQLite optimization for concurrency, POSIX file locking, and WAL journal mode
+	if driver == "sqlite" {
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+		_, _ = db.Exec("PRAGMA journal_mode = WAL")
+		_, _ = db.Exec("PRAGMA busy_timeout = 6000")
 	}
 
 	g.db = db

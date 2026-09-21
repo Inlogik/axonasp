@@ -29,7 +29,7 @@ import (
 	"testing"
 	"time"
 
-	"g3pix.com.br/axonasp/axonvm/asp"
+	"g3pix.com.br/axonasp/v2/axonvm/asp"
 )
 
 // TestOptimizationRedimPreserve verifies the O(log N) capacity growth logic.
@@ -149,8 +149,8 @@ func TestOptimizationFSOCache(t *testing.T) {
 	}
 }
 
-// TestVMPoolPrewarming verifies that pools are pre-warmed with initialized VMs.
-func TestVMPoolPrewarming(t *testing.T) {
+// TestVMPoolLazyInitialization verifies that pools do not allocate VMs until acquired.
+func TestVMPoolLazyInitialization(t *testing.T) {
 	compiler := NewASPCompiler(`<% Response.Write "prewarm" %>`)
 	if err := compiler.Compile(); err != nil {
 		t.Fatalf("compile failed: %v", err)
@@ -159,20 +159,19 @@ func TestVMPoolPrewarming(t *testing.T) {
 	program := cachedProgramFromCompiler(compiler)
 	pool := getProgramPool(program)
 
-	// Check if pool is pre-warmed. warmLimit is 5.
+	// Pool entries are intentionally allocated lazily to avoid retaining VMs for
+	// scripts that may never execute again.
 	pool.mu.Lock()
 	count := len(pool.items)
 	pool.mu.Unlock()
 
-	if count != 5 {
-		t.Errorf("expected 5 pre-warmed VMs, got %d", count)
+	if count != 0 {
+		t.Errorf("expected an empty newly-created pool, got %d VMs", count)
 	}
 
-	// Verify one VM from pool
-	vm := pool.get()
-	if vm == nil {
-		t.Fatal("failed to get VM from pre-warmed pool")
-	}
+	// Verify normal acquisition creates and links a VM to the pool.
+	vm := AcquireVMFromCachedProgram(program)
+	defer vm.Release()
 	if vm.pooledFrom != pool {
 		t.Errorf("VM should be linked to its pool")
 	}

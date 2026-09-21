@@ -47,6 +47,13 @@ func (vm *VM) jsGetOrCreateStreamModule() Value {
 		}
 	}
 
+	// Load events before executing the stream polyfill. Compiling and running
+	// events from a nested require while stream's dynamic program is active can
+	// invalidate the caller's execution state.
+	if events := vm.jsGetOrCreateEventsModule(); events.Type == VTJSUndefined {
+		return Value{Type: VTJSUndefined}
+	}
+
 	moduleVal := vm.jsRunNodeStreamPolyfill()
 	if moduleVal.Type == VTJSUndefined {
 		return Value{Type: VTJSUndefined}

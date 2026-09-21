@@ -27,7 +27,7 @@ import (
 	"sync"
 	"time"
 
-	"g3pix.com.br/axonasp/axonvm/asp"
+	"g3pix.com.br/axonasp/v2/axonvm/asp"
 )
 
 type vmProgramPool struct {
@@ -126,15 +126,6 @@ func getProgramPool(program CachedProgram) *vmProgramPool {
 		items:       make([]*VM, 0, limit),
 		maxRetained: limit,
 		program:     immutableCachedProgramView(program),
-	}
-
-	// Pre-warming: Fill the pool with a few pre-allocated VMs to handle initial bursts.
-	// We don't fill the entire limit (250) to avoid excessive memory usage in tests/rare scripts.
-	warmLimit := min(limit, 5)
-	for range warmLimit {
-		vm := NewVMFromCachedProgram(entry.program)
-		vm.pooledFrom = entry
-		entry.items = append(entry.items, vm)
 	}
 
 	actual, _ := cachedProgramPools.LoadOrStore(key, entry)
@@ -373,6 +364,8 @@ func (vm *VM) resetForReuse() {
 	clear(vm.runtimeClassItems)
 	vm.nextDynamicNativeID = 20000
 	vm.nextDynamicClassID = 60000
+	vm.jsActiveEnvID = 0
+	vm.jsRootEnvID = 0
 	vm.comInitialized = false
 	vm.comThreadLocked = false
 	// Zero-fill icState for fresh execution.
@@ -762,6 +755,9 @@ func (vm *VM) ensureDynamicMaps() {
 	if vm.jsObjectKeyOrder == nil {
 		vm.jsObjectKeyOrder = make(map[int64][]string)
 	}
+	if vm.jsObjectKeySet == nil {
+		vm.jsObjectKeySet = make(map[int64]map[string]struct{})
+	}
 	if vm.jsObjectSlots == nil {
 		vm.jsObjectSlots = make(map[int64][]Value)
 	}
@@ -790,10 +786,10 @@ func (vm *VM) ensureDynamicMaps() {
 		vm.jsFunctionItems = make(map[int64]*jsFunctionObject)
 	}
 	if vm.jsForInItems == nil {
-		vm.jsForInItems = make(map[int]*jsForInEnumerator)
+		vm.jsForInItems = make(map[jsLoopEnumeratorKey]*jsForInEnumerator)
 	}
 	if vm.jsForOfItems == nil {
-		vm.jsForOfItems = make(map[int]*jsForOfEnumerator)
+		vm.jsForOfItems = make(map[jsLoopEnumeratorKey]*jsForOfEnumerator)
 	}
 	if vm.jsEnvItems == nil {
 		vm.jsEnvItems = make(map[int64]*jsEnvFrame)
@@ -967,6 +963,7 @@ func (vm *VM) resetDynamicMaps() {
 	clear(vm.nativeObjectProxies)
 	clear(vm.jsObjectItems)
 	clear(vm.jsObjectKeyOrder)
+	clear(vm.jsObjectKeySet)
 	clear(vm.jsObjectSlots)
 	clear(vm.jsObjectSlotIndex)
 	clear(vm.jsObjectShape)

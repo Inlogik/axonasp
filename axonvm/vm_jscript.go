@@ -42,18 +42,20 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
-	"g3pix.com.br/axonasp/axonconfig"
-	"g3pix.com.br/axonasp/jscript"
-	"g3pix.com.br/axonasp/jscript/ftoa"
-	"g3pix.com.br/axonasp/vbscript"
+	"g3pix.com.br/axonasp/v2/axonconfig"
+	"g3pix.com.br/axonasp/v2/axonvm/asp"
+	"g3pix.com.br/axonasp/v2/jscript"
+	"g3pix.com.br/axonasp/v2/jscript/ftoa"
+	"g3pix.com.br/axonasp/v2/vbscript"
 	"github.com/dlclark/regexp2"
 	"github.com/goodsign/monday"
 	"golang.org/x/text/unicode/norm"
 )
 
-const jsMaxStringBytes = 8 * 1024 * 1024
-const jsMaxStringWorkBytes = 2 * 1024 * 1024
-const jsMaxCallStackDepth = 10100
+// JavaScript engine limits - these are used to prevent excessive resource usage and potential denial-of-service attacks. If Go GC is set to a value lower than 1GB, these limits may cause issues if the script tries to allocate more memory than allowed. AxonASP default memory usage is 256MB as most JScript applications don't require large amounts of memory. If you really need to work with huge strings, you can adjust the limits in the source code and recompile the VM. However, be aware that this may lead to increased memory usage and potential instability if scripts are not well-behaved.
+const jsMaxStringBytes = 512 * 1024 * 1024     //512 MB - usually this must be enought for most use cases
+const jsMaxStringWorkBytes = 256 * 1024 * 1024 //256 MB cumulative string work budget; catches self-expanding rescans fast while leaving generous room for legitimate pages
+const jsMaxCallStackDepth = 50000
 const jsInternalPropPrefix = "__js_"
 const jsAccessorGetterPrefix = "__js_getter__"
 const jsAccessorSetterPrefix = "__js_setter__"
@@ -64,6 +66,7 @@ const jsStrictModeFlag = "__axon_internal__:strict_mode"
 const jsGeneratorFlag = "__axon_internal__:generator"
 const jsAsyncFlag = "__axon_internal__:async"
 const jsDerivedConstructorFlag = "__axon_internal__:derived_constructor"
+const jsUsesArgumentsFlag = "__axon_internal__:uses_arguments"
 const jsFunctionSourceMetaPrefix = "__js_source__:"
 const jsModuleExportPrefix = "__js_export__:"
 const jsHexUpperDigits = "0123456789ABCDEF"
@@ -94,8 +97,10 @@ type jsPropertyDescriptor struct {
 }
 
 type jsEnvFrame struct {
-	parentID int64
-	bindings map[string]Value
+	parentID         int64
+	bindings         map[string]Value
+	capturedClosures int
+	argumentsObjID   int64
 }
 
 type jsArgumentsBinding struct {
@@ -124,6 +129,7 @@ type jsFunctionObject struct {
 	params     []string
 	restParam  string
 	localCount int
+	localNames []string
 	startIP    int
 	endIP      int
 	envID      int64
@@ -142,6 +148,7 @@ type jsFunctionObject struct {
 	homeObjID               int64
 	isAsync                 bool
 	isGenerator             bool
+	usesArguments           bool
 	capturedBlockScopes     []map[string]Value
 	capturedBlockScopeConst []map[string]struct{}
 	capturedBlockScopeTDZ   []map[string]struct{}
@@ -173,6 +180,11 @@ type jsCallFrame struct {
 type jsForInEnumerator struct {
 	keys  []string
 	index int
+}
+
+type jsLoopEnumeratorKey struct {
+	opPos int
+	envID int64
 }
 
 // jsForOfEnumerator holds the collected values for a for...of loop.
@@ -895,7 +907,10 @@ func (vm *VM) jsEval(args []Value) Value {
 	compiler := NewASPCompiler("")
 	compiler.sourceName = vm.sourceName
 	vm.jsPrepareDynamicCompilerIC(compiler)
-	compiler.compileJScriptEvalSnippet(expr)
+	if err := compiler.compileJScriptEvalSnippet(expr); err != nil {
+		vm.jsThrowJSError(jscript.SyntaxError)
+		return Value{Type: VTJSUndefined}
+	}
 
 	if len(compiler.bytecode) == 0 {
 		return Value{Type: VTJSUndefined}
@@ -908,7 +923,7 @@ func (vm *VM) jsEval(args []Value) Value {
 		return Value{Type: VTJSUndefined}
 	}
 
-	child := vm.cloneForExecuteLocal(startIP)
+	child := vm.cloneForExecuteLocalSharedRuntime(startIP)
 	if err := child.Run(); err != nil {
 		vm.syncExecuteGlobalState(child)
 		if vmErr, ok := err.(*VMError); ok {
@@ -958,12 +973,25 @@ func (vm *VM) jsTrackObjectKey(objID int64, key string) {
 	if strings.HasPrefix(key, jsInternalPropPrefix) {
 		return
 	}
-	order := vm.jsObjectKeyOrder[objID]
-	// Check if already exists to maintain insertion order (only add if new)
-	if slices.Contains(order, key) {
+	if vm.jsObjectKeySet == nil {
+		vm.jsObjectKeySet = make(map[int64]map[string]struct{})
+	}
+	// O(1) membership test preserves insertion order without rescanning the
+	// whole key-order slice on every new property (avoids O(N^2) growth when a
+	// single object accumulates many distinct keys).
+	seen := vm.jsObjectKeySet[objID]
+	if seen == nil {
+		seen = make(map[string]struct{}, len(vm.jsObjectKeyOrder[objID])+4)
+		for _, k := range vm.jsObjectKeyOrder[objID] {
+			seen[k] = struct{}{}
+		}
+		vm.jsObjectKeySet[objID] = seen
+	}
+	if _, ok := seen[key]; ok {
 		return
 	}
-	vm.jsObjectKeyOrder[objID] = append(order, key)
+	seen[key] = struct{}{}
+	vm.jsObjectKeyOrder[objID] = append(vm.jsObjectKeyOrder[objID], key)
 }
 
 func (vm *VM) jsUntrackObjectKey(objID int64, key string) {
@@ -974,6 +1002,9 @@ func (vm *VM) jsUntrackObjectKey(objID int64, key string) {
 	for i, k := range order {
 		if k == key {
 			vm.jsObjectKeyOrder[objID] = append(order[:i], order[i+1:]...)
+			if seen, ok := vm.jsObjectKeySet[objID]; ok {
+				delete(seen, key)
+			}
 			return
 		}
 	}
@@ -1853,13 +1884,18 @@ func (vm *VM) ensureJSRootEnv() {
 	bindings["Math"] = vm.jsCreateMathObject()
 	bindings["Date"] = vm.jsCreateIntrinsicObject("", "Date")
 	bindings["RegExp"] = vm.jsCreateIntrinsicObject("", "RegExp")
+	bindings["ActiveXObject"] = vm.jsCreateIntrinsicObject("", "ActiveXObject")
 	bindings["Enumerator"] = vm.jsCreateIntrinsicObject("", "Enumerator")
 	bindings["VBArray"] = vm.jsCreateIntrinsicObject("", "VBArray")
 	bindings["String"] = vm.jsCreateIntrinsicObject("", "String")
 	bindings["Array"] = vm.jsCreateIntrinsicObject("", "Array")
 	bindings["Object"] = vm.jsCreateIntrinsicObject("", "Object")
 	bindings["Function"] = vm.jsCreateIntrinsicObject("", "Function")
-	bindings["JSON"] = vm.jsCreateIntrinsicObject("", "JSON")
+	jsonObject := vm.jsCreateIntrinsicObject("", "JSON")
+	for _, method := range []string{"parse", "stringify"} {
+		vm.jsSetDescriptor(jsonObject.Num, method, jsBuiltinMethodDescriptor(vm.jsCreateIntrinsicFunction(method, "JSONMethod")))
+	}
+	bindings["JSON"] = jsonObject
 	bindings["Atomics"] = vm.jsCreateAtomicsObject()
 	bindings["Proxy"] = vm.jsCreateProxyObject()
 	bindings["Reflect"] = vm.jsCreateReflectObject()
@@ -1906,6 +1942,8 @@ func (vm *VM) ensureJSRootEnv() {
 	bindings["decodeURIComponent"] = vm.jsCreateIntrinsicObject("", "decodeURIComponent")
 	bindings["encodeURI"] = vm.jsCreateIntrinsicObject("", "encodeURI")
 	bindings["encodeURIComponent"] = vm.jsCreateIntrinsicObject("", "encodeURIComponent")
+	bindings["escape"] = vm.jsCreateIntrinsicObject("", "escape")
+	bindings["unescape"] = vm.jsCreateIntrinsicObject("", "unescape")
 	bindings["ScriptEngine"] = vm.jsCreateIntrinsicObject("", "ScriptEngine")
 	bindings["ScriptEngineMajorVersion"] = vm.jsCreateIntrinsicObject("", "ScriptEngineMajorVersion")
 	bindings["ScriptEngineMinorVersion"] = vm.jsCreateIntrinsicObject("", "ScriptEngineMinorVersion")
@@ -2325,9 +2363,9 @@ func (vm *VM) jsAllocSymbolID() int64 {
 func (vm *VM) jsValueMapKey(v Value) string {
 	v = resolveCallable(vm, v)
 	switch v.Type {
-	case VTJSUndefined:
+	case VTJSUndefined, VTEmpty:
 		return "u"
-	case VTNull, VTEmpty:
+	case VTNull:
 		return "n"
 	case VTBool:
 		return "b:" + strconv.FormatInt(v.Num, 10)
@@ -2514,14 +2552,14 @@ func (vm *VM) jsSetNameInEnv(envID int64, name string, val Value) {
 // jsGetBlockScopeValue reads from block scopes (innermost first). Returns the value and
 // whether it was found. Raises ReferenceError if the variable is in TDZ (const before init).
 func (vm *VM) jsGetBlockScopeValue(name string) (Value, bool) {
-	for i := len(vm.jsBlockScopes) - 1; i >= 0; i-- {
-		if _, exists := vm.jsBlockScopes[i][name]; exists {
+	for i, v := range slices.Backward(vm.jsBlockScopes) {
+		if _, exists := v[name]; exists {
 			// Check TDZ for const variables (access before initialization).
 			if _, inTDZ := vm.jsBlockScopeTDZ[i][name]; inTDZ {
 				vm.jsThrowReferenceError(fmt.Sprintf("Cannot access '%s' before initialization", name))
 				return Value{Type: VTJSUndefined}, true
 			}
-			return vm.jsBlockScopes[i][name], true
+			return v[name], true
 		}
 	}
 	return Value{Type: VTJSUndefined}, false
@@ -2531,8 +2569,8 @@ func (vm *VM) jsGetBlockScopeValue(name string) (Value, bool) {
 // Returns true if found and set. Raises TypeError for const reassignment.
 // Raises ReferenceError if const is in TDZ (accessed before initialization).
 func (vm *VM) jsSetBlockScopeValue(name string, val Value) bool {
-	for i := len(vm.jsBlockScopes) - 1; i >= 0; i-- {
-		if _, exists := vm.jsBlockScopes[i][name]; exists {
+	for i, v := range slices.Backward(vm.jsBlockScopes) {
+		if _, exists := v[name]; exists {
 			// Check TDZ for const before initialization.
 			if _, inTDZ := vm.jsBlockScopeTDZ[i][name]; inTDZ {
 				vm.jsThrowReferenceError(fmt.Sprintf("Cannot access '%s' before initialization", name))
@@ -2543,7 +2581,7 @@ func (vm *VM) jsSetBlockScopeValue(name string, val Value) bool {
 				vm.jsThrowTypeError(fmt.Sprintf("Assignment to constant variable '%s'", name))
 				return true
 			}
-			vm.jsBlockScopes[i][name] = val
+			v[name] = val
 			return true
 		}
 	}
@@ -2570,6 +2608,7 @@ func (vm *VM) jsSetName(name string, val Value) {
 		}
 		if _, ok := env.bindings[name]; ok {
 			env.bindings[name] = val
+			vm.jsSetActiveParameterLocal(name, val)
 			vm.jsSyncArgumentAliasByParam(envID, name, val)
 			vm.jsBridgeToVBGlobal(name, val)
 			return
@@ -2592,11 +2631,50 @@ func (vm *VM) jsSetName(name string, val Value) {
 		return
 	}
 
-	// Non-strict mode: create variable in root/current environment
-	root := vm.jsEnvItems[vm.jsActiveEnvID]
+	// Non-strict assignment to an undeclared identifier creates a property in
+	// the global environment, not in the currently executing function frame.
+	root := vm.jsEnvItems[vm.jsRootEnvID]
 	if root != nil {
 		root.bindings[name] = val
-		vm.jsSyncArgumentAliasByParam(vm.jsActiveEnvID, name, val)
+	}
+}
+
+func (vm *VM) jsSetActiveParameterLocal(name string, val Value) {
+	if len(vm.jsCallStack) == 0 {
+		return
+	}
+	frame := vm.jsCallStack[len(vm.jsCallStack)-1]
+	closure := vm.jsFunctionItems[frame.fn.Num]
+	if closure == nil {
+		return
+	}
+	for slot, parameter := range closure.params {
+		if parameter != name || slot >= closure.localCount {
+			continue
+		}
+		idx := vm.fp + slot
+		if idx >= 0 && idx < len(vm.stack) {
+			vm.stack[idx] = val
+		}
+		return
+	}
+}
+
+func (vm *VM) jsSyncActiveLocalSlot(slot int, value Value) {
+	if slot < 0 || len(vm.jsCallStack) == 0 {
+		return
+	}
+	frame := vm.jsCallStack[len(vm.jsCallStack)-1]
+	closure := vm.jsFunctionItems[frame.fn.Num]
+	if closure == nil || slot >= len(closure.localNames) {
+		return
+	}
+	name := closure.localNames[slot]
+	if name == "" {
+		return
+	}
+	if env := vm.jsEnvItems[vm.jsActiveEnvID]; env != nil {
+		env.bindings[name] = value
 	}
 }
 
@@ -2660,6 +2738,10 @@ func (vm *VM) jsGetName(name string) Value {
 	if idx, ok := vm.lookupJSGlobalIndex(name); ok {
 		return vm.Globals[idx]
 	}
+	// Classic Microsoft JScript reports an unresolved identifier when it is
+	// evaluated. Returning undefined here hides application errors and lets
+	// pages continue with different output than IIS.
+	vm.jsThrowReferenceError(fmt.Sprintf("%s is undefined", name))
 	return Value{Type: VTJSUndefined}
 }
 
@@ -2681,8 +2763,8 @@ func (vm *VM) jsResolveWithBinding(name string) (Value, bool) {
 	if len(vm.withStack) == 0 {
 		return Value{Type: VTJSUndefined}, false
 	}
-	for i := len(vm.withStack) - 1; i >= 0; i-- {
-		target := vm.withStack[i]
+	for _, target := range slices.Backward(vm.withStack) {
+
 		if !vm.jsHasProperty(target, name) {
 			continue
 		}
@@ -2702,8 +2784,8 @@ func (vm *VM) jsAssignWithBinding(name string, val Value) bool {
 	if len(vm.withStack) == 0 {
 		return false
 	}
-	for i := len(vm.withStack) - 1; i >= 0; i-- {
-		target := vm.withStack[i]
+	for _, target := range slices.Backward(vm.withStack) {
+
 		if !vm.jsHasProperty(target, name) {
 			continue
 		}
@@ -2910,7 +2992,8 @@ func (vm *VM) jsIsConstructor(v Value) bool {
 		ctorName := vm.jsObjectStringProperty(v, "__js_ctor")
 		return ctorName != "" && ctorName != "Symbol" && ctorName != "isNaN" && ctorName != "isFinite" &&
 			ctorName != "parseInt" && ctorName != "parseFloat" && ctorName != "decodeURI" &&
-			ctorName != "decodeURIComponent" && ctorName != "encodeURI" && ctorName != "encodeURIComponent"
+			ctorName != "decodeURIComponent" && ctorName != "encodeURI" && ctorName != "encodeURIComponent" &&
+			ctorName != "escape" && ctorName != "unescape"
 	case VTJSProxy:
 		if proxy, ok := vm.jsProxyItems[v.Num]; ok && !proxy.Revoked {
 			return vm.jsIsConstructor(proxy.Target)
@@ -3013,7 +3096,17 @@ func (vm *VM) jsAddValues(a Value, b Value) Value {
 		sa := vm.jsConcatString(a)
 		sb := vm.jsConcatString(b)
 		total := len(sa) + len(sb)
-		if !vm.jsEnsureStringSize(total) || !vm.jsChargeStringWork(total) {
+		if !vm.jsEnsureStringSize(total) {
+			return Value{Type: VTJSUndefined}
+		}
+		// In progressive string accumulation (e.g., str += "a"), charging O(len(sa) + len(sb))
+		// charges O(N^2) work for creating an N-byte string. Charge the net growth (min(len(sa), len(sb)))
+		// or at least 1 byte so that long concatenations stay well within budget while stopping exponential explosions.
+		work := min(len(sb), len(sa))
+		if work == 0 {
+			work = 1
+		}
+		if !vm.jsChargeStringWork(work) {
 			return Value{Type: VTJSUndefined}
 		}
 		return NewString(sa + sb)
@@ -3037,7 +3130,14 @@ func (vm *VM) jsAddValues(a Value, b Value) Value {
 		sa := vm.jsConcatString(aPrim)
 		sb := vm.jsConcatString(bPrim)
 		total := len(sa) + len(sb)
-		if !vm.jsEnsureStringSize(total) || !vm.jsChargeStringWork(total) {
+		if !vm.jsEnsureStringSize(total) {
+			return Value{Type: VTJSUndefined}
+		}
+		work := min(len(sb), len(sa))
+		if work == 0 {
+			work = 1
+		}
+		if !vm.jsChargeStringWork(work) {
 			return Value{Type: VTJSUndefined}
 		}
 		return NewString(sa + sb)
@@ -3150,30 +3250,63 @@ func (vm *VM) jsAsConcatArray(v Value) (Value, bool) {
 
 // jsArrayToString returns the ES3/ES5 Array toString()-style comma-joined representation.
 func (vm *VM) jsArrayToString(v Value) string {
-	if v.Type != VTArray || v.Arr == nil || len(v.Arr.Values) == 0 {
-		return ""
-	}
-	parts := make([]string, len(v.Arr.Values))
-	totalSize := 0
-	for i := 0; i < len(v.Arr.Values); i++ {
-		item := v.Arr.Values[i]
-		if item.Type == VTJSUndefined || item.Type == VTNull || item.Type == VTEmpty {
-			parts[i] = ""
-		} else {
-			parts[i] = vm.jsConcatString(item)
-		}
-		totalSize += len(parts[i])
-		if i > 0 {
-			totalSize++
-		}
-		if !vm.jsEnsureStringSize(totalSize) {
+	if v.Type == VTArray {
+		if v.Arr == nil || len(v.Arr.Values) == 0 {
 			return ""
 		}
+		parts := make([]string, len(v.Arr.Values))
+		totalSize := 0
+		for i := 0; i < len(v.Arr.Values); i++ {
+			item := v.Arr.Values[i]
+			if item.Type == VTJSUndefined || item.Type == VTNull || item.Type == VTEmpty {
+				parts[i] = ""
+			} else {
+				parts[i] = vm.jsConcatString(item)
+			}
+			totalSize += len(parts[i])
+			if i > 0 {
+				totalSize++
+			}
+			if !vm.jsEnsureStringSize(totalSize) {
+				return ""
+			}
+		}
+		if !vm.jsChargeStringWork(totalSize) {
+			return ""
+		}
+		return strings.Join(parts, ",")
 	}
-	if !vm.jsChargeStringWork(totalSize) {
-		return ""
+	if v.Type == VTJSObject {
+		length, isArrayLike, _ := vm.jsArrayLikeLength(v)
+		if !isArrayLike {
+			return vm.jsObjectToStringTag(v)
+		}
+		if length <= 0 {
+			return ""
+		}
+		parts := make([]string, length)
+		totalSize := 0
+		for i := range length {
+			item, ok := vm.jsArrayLikeGetIndex(v, i)
+			if !ok || item.Type == VTJSUndefined || item.Type == VTNull || item.Type == VTEmpty {
+				parts[i] = ""
+			} else {
+				parts[i] = vm.jsConcatString(item)
+			}
+			totalSize += len(parts[i])
+			if i > 0 {
+				totalSize++
+			}
+			if !vm.jsEnsureStringSize(totalSize) {
+				return ""
+			}
+		}
+		if !vm.jsChargeStringWork(totalSize) {
+			return ""
+		}
+		return strings.Join(parts, ",")
 	}
-	return strings.Join(parts, ",")
+	return ""
 }
 
 // jsEnsureStringSize guards JScript string-producing operations against runaway growth.
@@ -3181,7 +3314,7 @@ func (vm *VM) jsEnsureStringSize(size int) bool {
 	if size <= jsMaxStringBytes {
 		return true
 	}
-	vm.raise(vbscript.OutOfStringSpace, fmt.Sprintf("JScript string size exceeded %d bytes", jsMaxStringBytes))
+	vm.jsRaiseRuntimeError(jscript.OutOfStringSpace, fmt.Sprintf("JScript string size exceeded %d bytes", jsMaxStringBytes))
 	return false
 }
 
@@ -3194,7 +3327,7 @@ func (vm *VM) jsChargeStringWork(size int) bool {
 	if vm.jsStringWorkBytes <= jsMaxStringWorkBytes {
 		return true
 	}
-	vm.raise(vbscript.OutOfStringSpace, fmt.Sprintf("JScript cumulative string work exceeded %d bytes", jsMaxStringWorkBytes))
+	vm.jsRaiseRuntimeError(jscript.OutOfStringSpace, fmt.Sprintf("JScript cumulative string work exceeded %d bytes", jsMaxStringWorkBytes))
 	return false
 }
 
@@ -3214,11 +3347,27 @@ func (vm *VM) jsCreateClosure(template Value) Value {
 	isDerived := false
 	isGenerator := false
 	isAsync := false
+	usesArguments := false
+	var localNames []string
 	for i := 0; i < len(template.Names); i++ {
 		name := template.Names[i]
 		if after, ok := strings.CutPrefix(name, "__js_local_count__:"); ok {
 			if n, err := strconv.Atoi(after); err == nil && n > 0 {
 				localCount = n
+			}
+			continue
+		}
+		if after, ok := strings.CutPrefix(name, jsLocalNameTemplatePrefix); ok {
+			parts := strings.SplitN(after, ":", 2)
+			if len(parts) == 2 {
+				slot, slotErr := strconv.Atoi(parts[0])
+				decoded, decodeErr := base64.StdEncoding.DecodeString(parts[1])
+				if slotErr == nil && decodeErr == nil && slot >= 0 {
+					if len(localNames) <= slot {
+						localNames = append(localNames, make([]string, slot-len(localNames)+1)...)
+					}
+					localNames[slot] = string(decoded)
+				}
 			}
 			continue
 		}
@@ -3252,6 +3401,10 @@ func (vm *VM) jsCreateClosure(template Value) Value {
 			isDerived = true
 			continue
 		}
+		if name == jsUsesArgumentsFlag {
+			usesArguments = true
+			continue
+		}
 		params = append(params, name)
 	}
 	fnObj := &jsFunctionObject{
@@ -3260,6 +3413,7 @@ func (vm *VM) jsCreateClosure(template Value) Value {
 		params:             params,
 		restParam:          restParam,
 		localCount:         localCount,
+		localNames:         localNames,
 		startIP:            int(template.Num),
 		endIP:              int(template.Flt),
 		envID:              vm.jsActiveEnvID,
@@ -3269,6 +3423,7 @@ func (vm *VM) jsCreateClosure(template Value) Value {
 		isDerived:          isDerived,
 		isAsync:            isAsync,
 		isGenerator:        isGenerator,
+		usesArguments:      usesArguments,
 	}
 	if vm.jsBlockScopeDepth > 0 {
 		activeDepth := min(min(min(vm.jsBlockScopeDepth, len(vm.jsBlockScopes)), len(vm.jsBlockScopeConst)), len(vm.jsBlockScopeTDZ))
@@ -3284,6 +3439,11 @@ func (vm *VM) jsCreateClosure(template Value) Value {
 		fnObj.capturedThis = vm.jsThisValue
 	}
 	vm.jsFunctionItems[id] = fnObj
+	if fnObj.envID != 0 {
+		if env := vm.jsEnvItems[fnObj.envID]; env != nil {
+			env.capturedClosures++
+		}
+	}
 	vm.jsObjectItems[id] = make(map[string]Value, 2)
 	vm.jsPropertyItems[id] = make(map[string]jsPropertyDescriptor, 2)
 	vm.jsSetDescriptor(id, "prototype", jsPropertyDescriptor{
@@ -3380,9 +3540,11 @@ func (vm *VM) jsBeginFunctionCall(fn Value, thisVal Value, args []Value, ctorObj
 		}
 		bindings[closure.restParam] = ValueFromVBArray(NewVBArrayFromValues(0, restValues))
 	}
-	if _, hasArguments := bindings["arguments"]; !hasArguments {
-		argumentsObject := vm.jsCreateArgumentsObject(args, closure.params, envID)
-		bindings["arguments"] = argumentsObject
+	if closure.usesArguments {
+		if _, hasArguments := bindings["arguments"]; !hasArguments {
+			argumentsObject := vm.jsCreateArgumentsObject(fn, args, closure.params, envID)
+			bindings["arguments"] = argumentsObject
+		}
 	}
 	vm.jsEnvItems[envID] = &jsEnvFrame{parentID: closure.envID, bindings: bindings}
 	vm.jsActiveEnvID = envID
@@ -3401,6 +3563,11 @@ func (vm *VM) jsBeginFunctionCall(fn Value, thisVal Value, args []Value, ctorObj
 		vm.sp = frame.savedSP
 		return false
 	}
+	// Parameter slots are initialized by the function prologue, but seed them
+	// now so arguments aliasing is correct before or during nested calls.
+	for i := 0; i < len(closure.params) && i < closure.localCount; i++ {
+		vm.stack[vm.fp+i] = bindings[closure.params[i]]
+	}
 	vm.ip = closure.startIP
 	return true
 }
@@ -3416,7 +3583,7 @@ func (vm *VM) jsBeginDirectCall(callee Value, thisVal Value, args []Value) bool 
 	}
 	if closure.isClassConstructor {
 		vm.jsThrowTypeError("Class constructor cannot be invoked without 'new'")
-		return false
+		return true
 	}
 	if closure.isGenerator {
 		return false
@@ -3460,12 +3627,6 @@ func (vm *VM) jsCallDirectNoClone(callee Value, thisVal Value, args []Value) (Va
 	if closure.startIP < 0 || closure.endIP <= closure.startIP || closure.endIP > len(vm.bytecode) {
 		return Value{Type: VTJSUndefined}, false
 	}
-	for i := closure.startIP; i < closure.endIP; i++ {
-		if OpCode(vm.bytecode[i]) == OpJSThrow {
-			return Value{Type: VTJSUndefined}, false
-		}
-	}
-
 	savedIP := vm.ip
 	savedTryStack := append(make([]int, 0, len(vm.jsTryStack)), vm.jsTryStack...)
 	savedErrStack := append(make([]Value, 0, len(vm.jsErrStack)), vm.jsErrStack...)
@@ -3477,7 +3638,10 @@ func (vm *VM) jsCallDirectNoClone(callee Value, thisVal Value, args []Value) (Va
 		vm.ip = savedIP
 		return Value{Type: VTJSUndefined}, false
 	}
-	vm.jsCallStack[frameIdx].tryDepth = 0
+	// The nested Run executes with its own empty handler stack. Retain the
+	// caller's handler depth on the frame so a converted callback failure can
+	// unwind this frame after the caller handlers are restored below.
+	vm.jsCallStack[frameIdx].tryDepth = len(savedTryStack)
 	vm.jsTryStack = vm.jsTryStack[:0]
 	vm.jsErrStack = vm.jsErrStack[:0]
 	frameSavedSP := vm.jsCallStack[frameIdx].savedSP
@@ -3525,12 +3689,8 @@ func (vm *VM) jsEnvHasCapturedClosures(envID int64) bool {
 	if envID == 0 {
 		return false
 	}
-	for _, fn := range vm.jsFunctionItems {
-		if fn != nil && fn.envID == envID {
-			return true
-		}
-	}
-	return false
+	env := vm.jsEnvItems[envID]
+	return env != nil && env.capturedClosures > 0
 }
 
 // jsReleaseEnvFrame drops one non-captured JScript env frame and its transient arguments object.
@@ -3554,14 +3714,15 @@ func (vm *VM) jsReleaseEnvFrame(envID int64) {
 		}
 		clear(env.bindings)
 	}
+	env.argumentsObjID = 0
 	delete(vm.jsEnvItems, envID)
 }
 
 // jsRefreshArgumentsObject rewrites one existing arguments object in place.
-func (vm *VM) jsRefreshArgumentsObject(objID int64, args []Value, params []string, envID int64) {
+func (vm *VM) jsRefreshArgumentsObject(objID int64, callee Value, args []Value, params []string, envID int64) {
 	obj, ok := vm.jsObjectItems[objID]
 	if !ok {
-		obj = make(map[string]Value, len(args)+1)
+		obj = make(map[string]Value, len(args)+2)
 		vm.jsObjectItems[objID] = obj
 	} else {
 		clear(obj)
@@ -3570,6 +3731,9 @@ func (vm *VM) jsRefreshArgumentsObject(objID int64, args []Value, params []strin
 		obj[strconv.Itoa(i)] = args[i]
 	}
 	obj["length"] = NewInteger(int64(len(args)))
+	if callee.Type == VTJSFunction || callee.Type == VTJSObject {
+		obj["callee"] = callee
+	}
 
 	if len(params) > 0 && len(args) > 0 {
 		alias, ok := vm.jsArgumentsItems[objID]
@@ -3578,6 +3742,9 @@ func (vm *VM) jsRefreshArgumentsObject(objID int64, args []Value, params []strin
 			vm.jsArgumentsItems[objID] = alias
 		}
 		alias.envID = envID
+		if env := vm.jsEnvItems[envID]; env != nil {
+			env.argumentsObjID = objID
+		}
 		if alias.indexToParam == nil {
 			alias.indexToParam = make(map[string]string, len(params))
 		} else {
@@ -3659,16 +3826,18 @@ func (vm *VM) jsTailCallValue(callee Value, thisVal Value, args []Value) bool {
 		}
 		bindings[closure.restParam] = ValueFromVBArray(NewVBArrayFromValues(0, restValues))
 	}
-	if _, hasArguments := bindings["arguments"]; !hasArguments {
-		if canReuseEnv {
-			if reusedArgs.Type == VTJSObject {
-				vm.jsRefreshArgumentsObject(reusedArgs.Num, args, closure.params, envID)
-				bindings["arguments"] = reusedArgs
+	if closure.usesArguments {
+		if _, hasArguments := bindings["arguments"]; !hasArguments {
+			if canReuseEnv {
+				if reusedArgs.Type == VTJSObject {
+					vm.jsRefreshArgumentsObject(reusedArgs.Num, callee, args, closure.params, envID)
+					bindings["arguments"] = reusedArgs
+				} else {
+					bindings["arguments"] = vm.jsCreateArgumentsObject(callee, args, closure.params, envID)
+				}
 			} else {
-				bindings["arguments"] = vm.jsCreateArgumentsObject(args, closure.params, envID)
+				bindings["arguments"] = vm.jsCreateArgumentsObject(callee, args, closure.params, envID)
 			}
-		} else {
-			bindings["arguments"] = vm.jsCreateArgumentsObject(args, closure.params, envID)
 		}
 	}
 
@@ -3700,13 +3869,16 @@ func (vm *VM) jsTailCallValue(callee Value, thisVal Value, args []Value) bool {
 	return true
 }
 
-func (vm *VM) jsCreateArgumentsObject(args []Value, params []string, envID int64) Value {
+func (vm *VM) jsCreateArgumentsObject(callee Value, args []Value, params []string, envID int64) Value {
 	objID := vm.allocJSID()
-	obj := make(map[string]Value, len(args)+1)
+	obj := make(map[string]Value, len(args)+2)
 	for i := range args {
 		obj[strconv.Itoa(i)] = args[i]
 	}
 	obj["length"] = NewInteger(int64(len(args)))
+	if callee.Type == VTJSFunction || callee.Type == VTJSObject {
+		obj["callee"] = callee
+	}
 	vm.jsObjectItems[objID] = obj
 	vm.jsPropertyItems[objID] = make(map[string]jsPropertyDescriptor, len(args)+1)
 	if len(params) > 0 && len(args) > 0 {
@@ -3728,25 +3900,29 @@ func (vm *VM) jsCreateArgumentsObject(args []Value, params []string, envID int64
 			vm.jsArgumentsItems = make(map[int64]*jsArgumentsBinding, 8)
 		}
 		vm.jsArgumentsItems[objID] = alias
+		if env := vm.jsEnvItems[envID]; env != nil {
+			env.argumentsObjID = objID
+		}
 	}
 	return Value{Type: VTJSObject, Num: objID}
 }
 
 func (vm *VM) jsSyncArgumentAliasByParam(envID int64, name string, value Value) {
-	if len(vm.jsArgumentsItems) == 0 {
+	env := vm.jsEnvItems[envID]
+	if env == nil || env.argumentsObjID == 0 {
 		return
 	}
-	for objID, alias := range vm.jsArgumentsItems {
-		if alias == nil || alias.envID != envID {
-			continue
-		}
-		idxStr, ok := alias.paramToIndex[name]
-		if !ok {
-			continue
-		}
-		if obj, exists := vm.jsObjectItems[objID]; exists {
-			obj[idxStr] = value
-		}
+	objID := env.argumentsObjID
+	alias := vm.jsArgumentsItems[objID]
+	if alias == nil {
+		return
+	}
+	idxStr, ok := alias.paramToIndex[name]
+	if !ok {
+		return
+	}
+	if obj, exists := vm.jsObjectItems[objID]; exists {
+		obj[idxStr] = value
 	}
 }
 func (vm *VM) jsSetAliasedArgumentValue(objID int64, key string, value Value) bool {
@@ -3780,6 +3956,7 @@ func (vm *VM) jsSetAliasedArgumentValue(objID int64, key string, value Value) bo
 // jsSyncAliasedLocalSlot mirrors a parameter local-slot write to the active env.
 // This keeps non-strict arguments aliasing coherent when params are lowered to local slots.
 func (vm *VM) jsSyncAliasedLocalSlot(slot int, value Value) {
+	vm.jsSyncActiveLocalSlot(slot, value)
 	if slot < 0 || len(vm.jsCallStack) == 0 {
 		return
 	}
@@ -3814,6 +3991,22 @@ func (vm *VM) jsGetAliasedArgumentValue(objID int64, key string) (Value, bool) {
 	paramName, ok := alias.indexToParam[key]
 	if !ok {
 		return Value{Type: VTJSUndefined}, false
+	}
+	// Parameters lowered to local slots are authoritative. Read the active
+	// parameter slot so arguments[n] observes named-parameter assignments.
+	if alias.envID == vm.jsActiveEnvID && len(vm.jsCallStack) > 0 {
+		frame := vm.jsCallStack[len(vm.jsCallStack)-1]
+		if closure := vm.jsFunctionItems[frame.fn.Num]; closure != nil {
+			for slot, name := range closure.params {
+				if name == paramName && slot < closure.localCount {
+					idx := vm.fp + slot
+					if idx >= 0 && idx < len(vm.stack) {
+						return vm.stack[idx], true
+					}
+					break
+				}
+			}
+		}
 	}
 	env := vm.jsEnvItems[alias.envID]
 	if env == nil {
@@ -4028,6 +4221,75 @@ func jsEncodeURIValue(input string, component bool) string {
 	return out.String()
 }
 
+// jsEscapeValue implements classic JScript / ECMAScript 3 escape() encoding.
+func jsEscapeValue(input string) string {
+	if input == "" {
+		return ""
+	}
+	var out strings.Builder
+	out.Grow(len(input))
+	for _, r := range input {
+		switch {
+		case (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') ||
+			r == '*' || r == '@' || r == '-' || r == '_' || r == '+' || r == '.' || r == '/':
+			out.WriteRune(r)
+		case r < 256:
+			out.WriteByte('%')
+			out.WriteByte(jsHexUpperDigits[r>>4])
+			out.WriteByte(jsHexUpperDigits[r&0x0F])
+		case r <= 0xFFFF:
+			out.WriteString("%u")
+			out.WriteByte(jsHexUpperDigits[(r>>12)&0x0F])
+			out.WriteByte(jsHexUpperDigits[(r>>8)&0x0F])
+			out.WriteByte(jsHexUpperDigits[(r>>4)&0x0F])
+			out.WriteByte(jsHexUpperDigits[r&0x0F])
+		default:
+			r1, r2 := utf16.EncodeRune(r)
+			out.WriteString("%u")
+			out.WriteByte(jsHexUpperDigits[(r1>>12)&0x0F])
+			out.WriteByte(jsHexUpperDigits[(r1>>8)&0x0F])
+			out.WriteByte(jsHexUpperDigits[(r1>>4)&0x0F])
+			out.WriteByte(jsHexUpperDigits[r1&0x0F])
+			out.WriteString("%u")
+			out.WriteByte(jsHexUpperDigits[(r2>>12)&0x0F])
+			out.WriteByte(jsHexUpperDigits[(r2>>8)&0x0F])
+			out.WriteByte(jsHexUpperDigits[(r2>>4)&0x0F])
+			out.WriteByte(jsHexUpperDigits[r2&0x0F])
+		}
+	}
+	return out.String()
+}
+
+// jsUnescapeValue implements classic JScript / ECMAScript 3 unescape() decoding.
+func jsUnescapeValue(input string) string {
+	if input == "" {
+		return ""
+	}
+	var out strings.Builder
+	out.Grow(len(input))
+	runes := []rune(input)
+	n := len(runes)
+	for i := 0; i < n; i++ {
+		if runes[i] == '%' {
+			if i+5 < n && (runes[i+1] == 'u' || runes[i+1] == 'U') {
+				if val, err := strconv.ParseUint(string(runes[i+2:i+6]), 16, 16); err == nil {
+					out.WriteRune(rune(val))
+					i += 5
+					continue
+				}
+			} else if i+2 < n {
+				if val, err := strconv.ParseUint(string(runes[i+1:i+3]), 16, 8); err == nil {
+					out.WriteRune(rune(val))
+					i += 2
+					continue
+				}
+			}
+		}
+		out.WriteRune(runes[i])
+	}
+	return out.String()
+}
+
 func jsDecodeURIComponentValue(input string) (string, error) {
 	if input == "" {
 		return "", nil
@@ -4186,6 +4448,12 @@ func (vm *VM) jsFunctionToString(fn Value) string {
 	}
 	if closure.source != "" {
 		src := strings.TrimSpace(closure.source)
+		if strings.HasPrefix(src, "(") && strings.HasSuffix(src, ")") {
+			src = strings.TrimSpace(src[1 : len(src)-1])
+		}
+		if strings.HasPrefix(src, "function") && !strings.HasPrefix(src, "function anonymous(") && strings.Contains(src, "/*") {
+			return src
+		}
 		if strings.HasPrefix(src, "function") && !strings.HasPrefix(src, "function anonymous(") {
 			return "(" + src + ")"
 		}
@@ -5219,6 +5487,11 @@ func (vm *VM) jsMemberGet(target Value, member string) (Value, bool) {
 				return vm.jsCreateIntrinsicFunction(member, "DatePrototype"), false
 			}
 		}
+		if vm.jsObjectStringProperty(target, "__js_ctor") == "Function" {
+			if strings.EqualFold(member, "caller") {
+				return vm.jsGetFunctionCaller(target), false
+			}
+		}
 		// Handle global/globalThis object - access properties from root environment bindings first
 		if target.Num == vm.jsRootEnvID && vm.jsRootEnvID != 0 {
 			if rootEnv, ok := vm.jsEnvItems[vm.jsRootEnvID]; ok {
@@ -5326,6 +5599,9 @@ func (vm *VM) jsMemberGet(target Value, member string) (Value, bool) {
 		if strings.EqualFold(member, "length") {
 			return NewInteger(int64(vm.jsFunctionExpectedLength(target))), false
 		}
+		if strings.EqualFold(member, "caller") {
+			return vm.jsGetFunctionCaller(target), false
+		}
 		desc, hasDesc := vm.jsResolveObjectMember(target.Num, member, make(map[int64]struct{}, 4))
 		if hasDesc {
 			if desc.HasGetter {
@@ -5388,6 +5664,16 @@ func (vm *VM) jsMemberGet(target Value, member string) (Value, bool) {
 
 // jsPrepareMemberCallee resolves one member access into a callable callee and its receiver.
 func (vm *VM) jsPrepareMemberCallee(target Value, member string) (Value, Value, bool, bool) {
+	if target.Type == VTJSObject || target.Type == VTJSFunction {
+		if desc, ok := vm.jsGetDescriptor(target.Num, member); ok && desc.HasValue {
+			if desc.Value.Type == VTJSFunction {
+				return desc.Value, target, true, false
+			}
+			if !vm.jsIsCallable(desc.Value) {
+				return Value{Type: VTJSUndefined}, Value{Type: VTJSUndefined}, false, false
+			}
+		}
+	}
 	callee, deferred := vm.jsMemberGet(target, member)
 	if deferred {
 		return Value{Type: VTJSUndefined}, Value{Type: VTJSUndefined}, false, true
@@ -5399,8 +5685,18 @@ func (vm *VM) jsPrepareMemberCallee(target Value, member string) (Value, Value, 
 }
 
 func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bool) {
+	if target.Type == VTJSObject && vm.jsObjectStringProperty(target, "__js_type") == "Math" {
+		if result, handled := vm.jsCallMathMethod(member, args); handled {
+			return result, true
+		}
+	}
 	if target.Type == VTJSObject {
 		objType := vm.jsObjectStringProperty(target, "__js_type")
+		if objType == "" && strings.EqualFold(member, "toString") {
+			if ctorName := vm.jsObjectStringProperty(target, "__js_ctor"); ctorName != "" {
+				return NewString("function " + ctorName + "() { [native code] }"), true
+			}
+		}
 		if objType == "String" || objType == "Number" || objType == "Boolean" {
 			if !vm.jsObjectHasOwnProperty(target, member) {
 				if obj, ok := vm.jsObjectItems[target.Num]; ok {
@@ -5449,9 +5745,19 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 		}
 	}
 
+	// User assignments to intrinsic-object members must take precedence over
+	// the engine's synthetic built-ins. For example, JSON.parse = function(...)
+	// wraps the native parser in legacy applications. Intrinsic methods are not
+	// stored as own descriptors, so this only intercepts explicit overrides.
 	if target.Type == VTJSObject {
-		class := vm.jsObjectStringProperty(target, "__js_type")
-		switch class {
+		if desc, ok := vm.jsGetDescriptor(target.Num, member); ok && desc.HasValue && vm.jsIsCallable(desc.Value) {
+			return vm.jsCall(desc.Value, target, args), true
+		}
+	}
+
+	if target.Type == VTJSObject {
+		objType := vm.jsObjectStringProperty(target, "__js_type")
+		switch objType {
 		case "fs":
 			if result, handled := vm.jsCallFSMethod(member, args); handled {
 				return result, true
@@ -5602,7 +5908,9 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 				}
 				out := make([]Value, end-start)
 				for i := start; i < end; i++ {
-					if v, ok := vm.jsArrayLikeGetIndex(target, i); ok {
+					if v, ok := vm.jsGetAliasedArgumentValue(target.Num, strconv.Itoa(i)); ok {
+						out[i-start] = v
+					} else if v, ok := vm.jsArrayLikeGetIndex(target, i); ok {
 						out[i-start] = v
 					} else {
 						out[i-start] = Value{Type: VTJSUndefined}
@@ -6069,18 +6377,62 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 			}
 			idxVal, _ := vm.jsMemberGet(res, "index")
 			return idxVal, true
-		case strings.EqualFold(member, "toLowerCase"):
+		case strings.EqualFold(member, "toLowerCase"), strings.EqualFold(member, "toLocaleLowerCase"):
 			out := strings.ToLower(text)
 			if !vm.jsEnsureStringSize(len(out)) || !vm.jsChargeStringWork(len(out)) {
 				return Value{Type: VTJSUndefined}, true
 			}
 			return NewString(out), true
-		case strings.EqualFold(member, "toUpperCase"):
+		case strings.EqualFold(member, "toUpperCase"), strings.EqualFold(member, "toLocaleUpperCase"):
 			out := strings.ToUpper(text)
 			if !vm.jsEnsureStringSize(len(out)) || !vm.jsChargeStringWork(len(out)) {
 				return Value{Type: VTJSUndefined}, true
 			}
 			return NewString(out), true
+		case strings.EqualFold(member, "lastIndexOf"):
+			if len(args) == 0 {
+				return NewInteger(-1), true
+			}
+			search := vm.valueToString(args[0])
+			searchRunes := []rune(search)
+			searchLen := len(searchRunes)
+			length := len(runes)
+			start := length
+			if len(args) > 1 && args[1].Type != VTJSUndefined {
+				num := vm.jsToNumber(args[1])
+				if math.IsNaN(num.Flt) {
+					start = length
+				} else {
+					n := int(num.Flt)
+					if n < 0 {
+						start = 0
+					} else if n > length {
+						start = length
+					} else {
+						start = n
+					}
+				}
+			}
+			if searchLen == 0 {
+				return NewInteger(int64(start)), true
+			}
+			maxStart := min(start, length-searchLen)
+			if maxStart < 0 {
+				return NewInteger(-1), true
+			}
+			for i := maxStart; i >= 0; i-- {
+				match := true
+				for j := range searchLen {
+					if runes[i+j] != searchRunes[j] {
+						match = false
+						break
+					}
+				}
+				if match {
+					return NewInteger(int64(i)), true
+				}
+			}
+			return NewInteger(-1), true
 		case strings.EqualFold(member, "localeCompare"):
 			other := vm.valueToString(jsArgOrUndefined(args, 0))
 			cmp := strings.Compare(text, other)
@@ -6115,6 +6467,13 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 			if len(args) == 0 || args[0].Type == VTJSUndefined {
 				return ValueFromVBArray(NewVBArrayFromValues(0, []Value{NewString(text)})), true
 			}
+			// Splitting walks the entire source string. Charge the scan against the
+			// cumulative string-work budget so a loop that repeatedly rescans a
+			// growing string (self-expanding split/join) is caught quickly instead of
+			// spinning until the script timeout.
+			if !vm.jsChargeStringWork(len(text)) {
+				return Value{Type: VTJSUndefined}, true
+			}
 			sepVal := args[0]
 			limit := -1
 			if len(args) > 1 && args[1].Type != VTJSUndefined {
@@ -6130,6 +6489,7 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 				lastByteIdx := 0
 				m, err := re.FindStringMatch(text)
 				for m != nil && (limit < 0 || len(values) < limit) {
+					vm.jsUpdateRegExpStaticProperties(text, m)
 					startByte := vm.jsRuneToByteOffset(text, m.Index)
 					lengthByte := vm.jsRuneToByteOffset(text[startByte:], m.Length)
 					values = append(values, NewString(text[lastByteIdx:startByte]))
@@ -6337,6 +6697,14 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 				return Value{Type: VTJSUndefined}, true
 			}
 			return NewString(padded), true
+		case strings.EqualFold(member, "anchor"), strings.EqualFold(member, "big"),
+			strings.EqualFold(member, "blink"), strings.EqualFold(member, "bold"),
+			strings.EqualFold(member, "fixed"), strings.EqualFold(member, "fontcolor"),
+			strings.EqualFold(member, "fontsize"), strings.EqualFold(member, "italics"),
+			strings.EqualFold(member, "link"), strings.EqualFold(member, "small"),
+			strings.EqualFold(member, "strike"), strings.EqualFold(member, "sub"),
+			strings.EqualFold(member, "sup"):
+			return vm.jsStringHTMLWrapper(target, member, args), true
 		}
 	case VTArray:
 		if target.Arr == nil {
@@ -6846,6 +7214,8 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 					return NewString(vm.jsRegExpToString(target)), true
 				case "Enumerator":
 					return NewString("[object Object]"), true
+				case "Array":
+					return NewString(vm.jsArrayToString(target)), true
 				default:
 					return NewString(vm.jsObjectToStringTag(target)), true
 				}
@@ -6967,6 +7337,24 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 			}
 		case "String":
 			switch {
+			case strings.EqualFold(member, "fromCharCode"):
+				if len(args) == 0 {
+					return NewString(""), true
+				}
+				codeUnits := make([]uint16, len(args))
+				for i := range args {
+					num := vm.jsToNumber(args[i])
+					if math.IsNaN(num.Flt) || math.IsInf(num.Flt, 0) {
+						codeUnits[i] = 0
+					} else {
+						codeUnits[i] = uint16(uint32(num.Flt))
+					}
+				}
+				res := string(utf16.Decode(codeUnits))
+				if !vm.jsEnsureStringSize(len(res)) || !vm.jsChargeStringWork(len(res)) {
+					return Value{Type: VTJSUndefined}, true
+				}
+				return NewString(res), true
 			case strings.EqualFold(member, "fromCodePoint"):
 				// String.fromCodePoint(...codePoints)
 				// Converts one or more code points to a string
@@ -7446,120 +7834,135 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 				return NewString(jsonText), true
 			}
 		case "Math":
-			switch {
-			case strings.EqualFold(member, "abs"):
-				if len(args) == 0 {
-					return NewDouble(math.NaN()), true
-				}
-				return NewDouble(math.Abs(vm.jsToNumber(args[0]).Flt)), true
-			case strings.EqualFold(member, "sin"):
-				return NewDouble(math.Sin(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "cos"):
-				return NewDouble(math.Cos(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "tan"):
-				return NewDouble(math.Tan(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "asin"):
-				return NewDouble(math.Asin(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "acos"):
-				return NewDouble(math.Acos(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "atan"):
-				return NewDouble(math.Atan(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "acosh"):
-				return NewDouble(math.Acosh(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "asinh"):
-				return NewDouble(math.Asinh(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "atanh"):
-				return NewDouble(math.Atanh(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "atan2"):
-				y := vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt
-				x := vm.jsToNumber(jsArgOrUndefined(args, 1)).Flt
-				return NewDouble(math.Atan2(y, x)), true
-			case strings.EqualFold(member, "ceil"):
-				return NewDouble(math.Ceil(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "floor"):
-				return NewDouble(math.Floor(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "trunc"):
-				return NewDouble(math.Trunc(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "sign"):
-				n := vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt
-				if math.IsNaN(n) {
-					return NewDouble(math.NaN()), true
-				}
-				if n > 0 {
-					return NewInteger(1), true
-				}
-				if n < 0 {
-					return NewInteger(-1), true
-				}
-				return NewInteger(0), true
-			case strings.EqualFold(member, "cbrt"):
-				return NewDouble(math.Cbrt(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "exp"):
-				return NewDouble(math.Exp(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "expm1"):
-				return NewDouble(math.Expm1(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "log"):
-				return NewDouble(math.Log(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "log1p"):
-				return NewDouble(math.Log1p(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "log10"):
-				return NewDouble(math.Log10(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "log2"):
-				return NewDouble(math.Log2(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "round"):
-				return NewDouble(vm.jsMathRound(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "sqrt"):
-				return NewDouble(math.Sqrt(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
-			case strings.EqualFold(member, "fround"):
-				return NewDouble(float64(float32(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt))), true
-			case strings.EqualFold(member, "clz32"):
-				value := vm.jsToUint32Exact(jsArgOrUndefined(args, 0))
-				return NewInteger(int64(bits.LeadingZeros32(value))), true
-			case strings.EqualFold(member, "imul"):
-				a := vm.jsToUint32Exact(jsArgOrUndefined(args, 0))
-				b := vm.jsToUint32Exact(jsArgOrUndefined(args, 1))
-				return NewInteger(int64(int32(a * b))), true
-			case strings.EqualFold(member, "hypot"):
-				if len(args) == 0 {
-					return NewInteger(0), true
-				}
-				hyp := 0.0
-				for i := range args {
-					n := vm.jsToNumber(args[i]).Flt
-					hyp = math.Hypot(hyp, n)
-				}
-				return NewDouble(hyp), true
-			case strings.EqualFold(member, "pow"):
-				base := vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt
-				exp := vm.jsToNumber(jsArgOrUndefined(args, 1)).Flt
-				return NewDouble(math.Pow(base, exp)), true
-			case strings.EqualFold(member, "max"):
-				if len(args) == 0 {
-					return NewDouble(math.Inf(-1)), true
-				}
-				maxVal := vm.jsToNumber(args[0]).Flt
-				for i := 1; i < len(args); i++ {
-					n := vm.jsToNumber(args[i]).Flt
-					if n > maxVal || math.IsNaN(n) {
-						maxVal = n
-					}
-				}
-				return NewDouble(maxVal), true
-			case strings.EqualFold(member, "min"):
-				if len(args) == 0 {
-					return NewDouble(math.Inf(1)), true
-				}
-				minVal := vm.jsToNumber(args[0]).Flt
-				for i := 1; i < len(args); i++ {
-					n := vm.jsToNumber(args[i]).Flt
-					if n < minVal || math.IsNaN(n) {
-						minVal = n
-					}
-				}
-				return NewDouble(minVal), true
-			case strings.EqualFold(member, "random"):
-				return NewDouble(rand.Float64()), true
+			return vm.jsCallMathMethod(member, args)
+		}
+	}
+
+	return vm.jsCallMemberLegacyMathContinuation(target, member, args)
+}
+
+func (vm *VM) jsCallMathMethod(member string, args []Value) (Value, bool) {
+	switch {
+	case strings.EqualFold(member, "abs"):
+		if len(args) == 0 {
+			return NewDouble(math.NaN()), true
+		}
+		return NewDouble(math.Abs(vm.jsToNumber(args[0]).Flt)), true
+	case strings.EqualFold(member, "sin"):
+		return NewDouble(math.Sin(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "cos"):
+		return NewDouble(math.Cos(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "tan"):
+		return NewDouble(math.Tan(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "asin"):
+		return NewDouble(math.Asin(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "acos"):
+		return NewDouble(math.Acos(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "atan"):
+		return NewDouble(math.Atan(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "acosh"):
+		return NewDouble(math.Acosh(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "asinh"):
+		return NewDouble(math.Asinh(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "atanh"):
+		return NewDouble(math.Atanh(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "atan2"):
+		y := vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt
+		x := vm.jsToNumber(jsArgOrUndefined(args, 1)).Flt
+		return NewDouble(math.Atan2(y, x)), true
+	case strings.EqualFold(member, "ceil"):
+		return NewDouble(math.Ceil(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "floor"):
+		return NewDouble(math.Floor(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "trunc"):
+		return NewDouble(math.Trunc(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "sign"):
+		n := vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt
+		if math.IsNaN(n) {
+			return NewDouble(math.NaN()), true
+		}
+		if n > 0 {
+			return NewInteger(1), true
+		}
+		if n < 0 {
+			return NewInteger(-1), true
+		}
+		return NewInteger(0), true
+	case strings.EqualFold(member, "cbrt"):
+		return NewDouble(math.Cbrt(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "exp"):
+		return NewDouble(math.Exp(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "expm1"):
+		return NewDouble(math.Expm1(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "log"):
+		return NewDouble(math.Log(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "log1p"):
+		return NewDouble(math.Log1p(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "log10"):
+		return NewDouble(math.Log10(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "log2"):
+		return NewDouble(math.Log2(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "round"):
+		return NewDouble(vm.jsMathRound(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "sqrt"):
+		return NewDouble(math.Sqrt(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt)), true
+	case strings.EqualFold(member, "fround"):
+		return NewDouble(float64(float32(vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt))), true
+	case strings.EqualFold(member, "clz32"):
+		value := vm.jsToUint32Exact(jsArgOrUndefined(args, 0))
+		return NewInteger(int64(bits.LeadingZeros32(value))), true
+	case strings.EqualFold(member, "imul"):
+		a := vm.jsToUint32Exact(jsArgOrUndefined(args, 0))
+		b := vm.jsToUint32Exact(jsArgOrUndefined(args, 1))
+		return NewInteger(int64(int32(a * b))), true
+	case strings.EqualFold(member, "hypot"):
+		if len(args) == 0 {
+			return NewInteger(0), true
+		}
+		hyp := 0.0
+		for i := range args {
+			n := vm.jsToNumber(args[i]).Flt
+			hyp = math.Hypot(hyp, n)
+		}
+		return NewDouble(hyp), true
+	case strings.EqualFold(member, "pow"):
+		base := vm.jsToNumber(jsArgOrUndefined(args, 0)).Flt
+		exp := vm.jsToNumber(jsArgOrUndefined(args, 1)).Flt
+		return NewDouble(math.Pow(base, exp)), true
+	case strings.EqualFold(member, "max"):
+		if len(args) == 0 {
+			return NewDouble(math.Inf(-1)), true
+		}
+		maxVal := vm.jsToNumber(args[0]).Flt
+		for i := 1; i < len(args); i++ {
+			n := vm.jsToNumber(args[i]).Flt
+			if n > maxVal || math.IsNaN(n) {
+				maxVal = n
 			}
+		}
+		return NewDouble(maxVal), true
+	case strings.EqualFold(member, "min"):
+		if len(args) == 0 {
+			return NewDouble(math.Inf(1)), true
+		}
+		minVal := vm.jsToNumber(args[0]).Flt
+		for i := 1; i < len(args); i++ {
+			n := vm.jsToNumber(args[i]).Flt
+			if n < minVal || math.IsNaN(n) {
+				minVal = n
+			}
+		}
+		return NewDouble(minVal), true
+	case strings.EqualFold(member, "random"):
+		return NewDouble(rand.Float64()), true
+	}
+	return Value{Type: VTJSUndefined}, false
+}
+
+func (vm *VM) jsCallMemberLegacyMathContinuation(target Value, member string, args []Value) (Value, bool) {
+	if target.Type == VTJSObject {
+		objType := vm.jsObjectStringProperty(target, "__js_type")
+		switch objType {
 		case "Set":
 			switch {
 			case strings.EqualFold(member, "add"):
@@ -7881,7 +8284,7 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 	// General fallback: dispatch based on target type
 	switch target.Type {
 	case VTNativeObject:
-		return vm.dispatchNativeCall(target.Num, member, args), true
+		return vm.jsDispatchNativeCall(target.Num, member, args), true
 	case VTJSObject, VTJSFunction, VTArray, VTString, VTDate, VTInteger, VTDouble, VTBool:
 		callee, deferred := vm.jsMemberGet(target, member)
 		if deferred {
@@ -7897,11 +8300,12 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 
 func (vm *VM) jsCreateErrorObject(name string, msg string) Value {
 	objID := vm.allocJSID()
-	obj := make(map[string]Value, 4)
+	obj := make(map[string]Value, 5)
 	obj["__js_type"] = NewString("Error")
 	obj["__js_ctor"] = NewString(name)
 	obj["name"] = NewString(name)
 	obj["message"] = NewString(msg)
+	obj["description"] = NewString(msg)
 	if proto := vm.jsGetIntrinsicPrototype(name); proto.Type == VTJSObject {
 		obj["__js_proto"] = proto
 	} else if proto := vm.jsGetIntrinsicPrototype("Error"); proto.Type == VTJSObject {
@@ -7932,7 +8336,14 @@ func (vm *VM) jsApplyMSJScriptErrorProps(errObj Value, args []Value) {
 		items["number"] = args[0]
 		items["description"] = NewString(desc)
 		items["message"] = NewString(desc)
+		return
 	}
+	// Single-argument / no-argument form keeps standard ES semantics: the MS
+	// extension properties stay undefined (jsCreateErrorObject seeds a
+	// description mirroring the message; remove it here so err.description and
+	// err.number are undefined, matching classic IIS JScript).
+	delete(items, "description")
+	delete(items, "number")
 }
 
 // jsNumberToString formats a numeric primitive using JScript-compatible defaults.
@@ -8060,7 +8471,10 @@ func (vm *VM) jsStringReplace(source string, patternArg Value, replacementArg Va
 
 	search := vm.valueToString(patternArg)
 	useCallback := replacementArg.Type == VTJSFunction
-	replacement := vm.valueToString(replacementArg)
+	replacement := ""
+	if !useCallback {
+		replacement = vm.jsToString(replacementArg)
+	}
 	if search == "" {
 		if replaceAll {
 			var b strings.Builder
@@ -8138,14 +8552,61 @@ func (vm *VM) jsStringReplace(source string, patternArg Value, replacementArg Va
 	return NewString(out)
 }
 
+// jsStringHTMLWrapper implements legacy ECMAScript Annex B / classic JScript HTML wrapper methods on String.prototype.
+func (vm *VM) jsStringHTMLWrapper(thisVal Value, method string, args []Value) Value {
+	str := vm.valueToString(thisVal)
+	var out string
+	switch strings.ToLower(method) {
+	case "anchor":
+		attr := vm.valueToString(jsArgOrUndefined(args, 0))
+		out = "<A NAME=\"" + attr + "\">" + str + "</A>"
+	case "big":
+		out = "<BIG>" + str + "</BIG>"
+	case "blink":
+		out = "<BLINK>" + str + "</BLINK>"
+	case "bold":
+		out = "<B>" + str + "</B>"
+	case "fixed":
+		out = "<TT>" + str + "</TT>"
+	case "fontcolor":
+		attr := vm.valueToString(jsArgOrUndefined(args, 0))
+		out = "<FONT COLOR=\"" + attr + "\">" + str + "</FONT>"
+	case "fontsize":
+		attr := vm.valueToString(jsArgOrUndefined(args, 0))
+		out = "<FONT SIZE=\"" + attr + "\">" + str + "</FONT>"
+	case "italics":
+		out = "<I>" + str + "</I>"
+	case "link":
+		attr := vm.valueToString(jsArgOrUndefined(args, 0))
+		out = "<A HREF=\"" + attr + "\">" + str + "</A>"
+	case "small":
+		out = "<SMALL>" + str + "</SMALL>"
+	case "strike":
+		out = "<STRIKE>" + str + "</STRIKE>"
+	case "sub":
+		out = "<SUB>" + str + "</SUB>"
+	case "sup":
+		out = "<SUP>" + str + "</SUP>"
+	default:
+		return Value{Type: VTJSUndefined}
+	}
+	if !vm.jsEnsureStringSize(len(out)) || !vm.jsChargeStringWork(len(out)) {
+		return Value{Type: VTJSUndefined}
+	}
+	return NewString(out)
+}
+
 // jsStringReplaceRegex applies one or all RegExp matches to the source string.
 func (vm *VM) jsStringReplaceRegex(source string, pattern string, flags string, replacementArg Value, replaceAll bool) Value {
 	re, err := vm.jsCompileRegExp(pattern, flags)
 	if err != nil {
 		return NewString(source)
 	}
-	replacement := vm.valueToString(replacementArg)
 	useCallback := replacementArg.Type == VTJSFunction
+	replacement := ""
+	if !useCallback {
+		replacement = vm.jsToString(replacementArg)
+	}
 	flagsLower := strings.ToLower(flags)
 	useAll := replaceAll || strings.Contains(flagsLower, "g")
 
@@ -8159,6 +8620,7 @@ func (vm *VM) jsStringReplaceRegex(source string, pattern string, flags string, 
 	}
 
 	for m != nil {
+		vm.jsUpdateRegExpStaticProperties(source, m)
 		startByte := vm.jsRuneToByteOffset(source, m.Index)
 		lengthByte := vm.jsRuneToByteOffset(source[startByte:], m.Length)
 		endByte := startByte + lengthByte
@@ -8405,7 +8867,7 @@ func (vm *VM) jsNativeCollectionItemByKeyIndex(source Value, idx int) Value {
 		return Value{Type: VTJSUndefined}
 	}
 	lookup := func(pos int) Value {
-		key := vm.dispatchNativeCall(keyMethod.Num, "", []Value{NewInteger(int64(pos))})
+		key := vm.jsDispatchNativeCall(keyMethod.Num, "", []Value{NewInteger(int64(pos))})
 		if key.Type == VTJSUndefined || key.Type == VTEmpty {
 			return Value{Type: VTJSUndefined}
 		}
@@ -8413,7 +8875,7 @@ func (vm *VM) jsNativeCollectionItemByKeyIndex(source Value, idx int) Value {
 		if keyStr == "" {
 			return Value{Type: VTJSUndefined}
 		}
-		return vm.dispatchNativeCall(source.Num, "", []Value{NewString(keyStr)})
+		return vm.jsDispatchNativeCall(source.Num, "", []Value{NewString(keyStr)})
 	}
 	value := lookup(idx + 1)
 	if value.Type != VTJSUndefined && value.Type != VTEmpty {
@@ -8477,20 +8939,20 @@ func (vm *VM) jsEnumeratorItem(obj Value) Value {
 		}
 		keyMethod := vm.dispatchMemberGet(source, "Key")
 		if keyMethod.Type != VTJSUndefined && keyMethod.Type != VTEmpty {
-			key := vm.dispatchNativeCall(keyMethod.Num, "", []Value{NewInteger(int64(idx + 1))})
+			key := vm.jsDispatchNativeCall(keyMethod.Num, "", []Value{NewInteger(int64(idx + 1))})
 			if key.Type != VTJSUndefined && key.Type != VTEmpty {
 				return key
 			}
-			key = vm.dispatchNativeCall(keyMethod.Num, "", []Value{NewInteger(int64(idx))})
+			key = vm.jsDispatchNativeCall(keyMethod.Num, "", []Value{NewInteger(int64(idx))})
 			if key.Type != VTJSUndefined && key.Type != VTEmpty {
 				return key
 			}
 		}
-		zeroBased := vm.dispatchNativeCall(source.Num, "Item", []Value{NewInteger(int64(idx))})
+		zeroBased := vm.jsDispatchNativeCall(source.Num, "Item", []Value{NewInteger(int64(idx))})
 		if zeroBased.Type != VTJSUndefined && zeroBased.Type != VTEmpty {
 			return zeroBased
 		}
-		oneBased := vm.dispatchNativeCall(source.Num, "Item", []Value{NewInteger(int64(idx + 1))})
+		oneBased := vm.jsDispatchNativeCall(source.Num, "Item", []Value{NewInteger(int64(idx + 1))})
 		if oneBased.Type != VTJSUndefined && oneBased.Type != VTEmpty {
 			return oneBased
 		}
@@ -8598,6 +9060,35 @@ func (vm *VM) jsMemberSet(target Value, member string, val Value) {
 		vm.dispatchMemberSet(target.Num, member, val)
 	case VTArray:
 		if target.Arr == nil {
+			return
+		}
+		if strings.EqualFold(member, "length") {
+			n := vm.jsToNumber(val).Flt
+			if math.IsNaN(n) || math.IsInf(n, 0) || n < 0 || n > float64(^uint32(0)) || n != math.Trunc(n) {
+				vm.jsThrowRangeError("Invalid array length")
+				return
+			}
+			newLen := int(n)
+			if newLen < len(target.Arr.Values) {
+				target.Arr.Values = target.Arr.Values[:newLen]
+			} else if newLen > len(target.Arr.Values) {
+				oldLen := len(target.Arr.Values)
+				target.Arr.Values = append(target.Arr.Values, make([]Value, newLen-oldLen)...)
+				for i := oldLen; i < newLen; i++ {
+					target.Arr.Values[i] = Value{Type: VTJSUndefined}
+				}
+			}
+			return
+		}
+		if idx, ok := jsParseArrayIndex(member); ok {
+			if idx >= len(target.Arr.Values) {
+				oldLen := len(target.Arr.Values)
+				target.Arr.Values = append(target.Arr.Values, make([]Value, idx-oldLen+1)...)
+				for i := oldLen; i < idx; i++ {
+					target.Arr.Values[i] = Value{Type: VTJSUndefined}
+				}
+			}
+			target.Arr.Values[idx] = val
 			return
 		}
 		if target.Arr.JSProps == nil {
@@ -9501,41 +9992,7 @@ func (vm *VM) jsCall(callee Value, thisVal Value, args []Value) Value {
 				vm.jsThrowJSError(jscript.OutOfStackSpace)
 				return Value{Type: VTJSUndefined}
 			}
-			child := vm.cloneForExecuteLocal(len(vm.bytecode))
-			if child.jsBeginFunctionCall(callee, thisVal, args, Value{Type: VTJSUndefined}, false, Value{Type: VTJSUndefined}, false) {
-				var childErr error
-				var childThrow *jsAsyncRejectionError
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							if are, ok := r.(*jsAsyncRejectionError); ok {
-								childThrow = are
-								return
-							}
-							panic(r)
-						}
-					}()
-					childErr = child.Run()
-				}()
-				if childThrow != nil {
-					vm.syncExecuteGlobalState(child)
-					vm.jsThrow(childThrow.reason)
-					return Value{Type: VTJSUndefined}
-				}
-				if childErr != nil {
-					vm.syncExecuteGlobalState(child)
-					if vmErr, ok := childErr.(*VMError); ok {
-						vm.jsThrowJSError(jscript.JSSyntaxErrorCode(vmErr.Code))
-						return Value{Type: VTJSUndefined}
-					}
-					vm.jsThrowTypeError(childErr.Error())
-					return Value{Type: VTJSUndefined}
-				}
-				result := Value{Type: VTJSUndefined}
-				if child.sp >= 0 {
-					result = child.stack[child.sp]
-				}
-				vm.syncExecuteGlobalState(child)
+			if result, handled := vm.jsCallDirectNoClone(callee, thisVal, args); handled {
 				return result
 			}
 			return Value{Type: VTJSUndefined}
@@ -9655,6 +10112,31 @@ func (vm *VM) jsCall(callee Value, thisVal Value, args []Value) Value {
 			return vm.jsCreateArrayIterator(thisVal, 2)
 		case "StringIteratorFactory":
 			return vm.jsCreateStringIterator(vm.valueToString(thisVal))
+		case "StringPrototypeHTMLWrapper":
+			methodName := vm.jsObjectStringProperty(callee, "name")
+			return vm.jsStringHTMLWrapper(thisVal, methodName, args)
+		case "StringFromCharCode":
+			if len(args) == 0 {
+				return NewString("")
+			}
+			codeUnits := make([]uint16, len(args))
+			for i := range args {
+				num := vm.jsToNumber(args[i])
+				if math.IsNaN(num.Flt) || math.IsInf(num.Flt, 0) {
+					codeUnits[i] = 0
+				} else {
+					codeUnits[i] = uint16(uint32(num.Flt))
+				}
+			}
+			res := string(utf16.Decode(codeUnits))
+			if !vm.jsEnsureStringSize(len(res)) || !vm.jsChargeStringWork(len(res)) {
+				return Value{Type: VTJSUndefined}
+			}
+			return NewString(res)
+		case "StringPrototypeMethod":
+			methodName := vm.jsObjectStringProperty(callee, "name")
+			res, _ := vm.jsCallMember(thisVal, methodName, args)
+			return res
 		case "RegExpStringIteratorIterator":
 			return thisVal
 		case "StringPrototypeMatchAll":
@@ -9760,10 +10242,33 @@ func (vm *VM) jsCall(callee Value, thisVal Value, args []Value) Value {
 			}
 			return Value{Type: VTJSUndefined}
 		case "ArrayPrototypeToString":
-			if thisVal.Type == VTArray {
+			if thisVal.Type == VTArray || thisVal.Type == VTJSObject {
 				return NewString(vm.jsArrayToString(thisVal))
 			}
 			return NewString(vm.jsObjectToStringTag(thisVal))
+		case "ArrayPrototypeMethod":
+			if result, handled := vm.jsCallMember(thisVal, vm.jsObjectStringProperty(callee, "name"), args); handled {
+				return result
+			}
+			return Value{Type: VTJSUndefined}
+		case "JSONMethod":
+			switch vm.jsObjectStringProperty(callee, "name") {
+			case "parse":
+				if len(args) == 0 {
+					return Value{Type: VTJSUndefined}
+				}
+				return vm.jsJSONParse(vm.valueToString(args[0]))
+			case "stringify":
+				if len(args) == 0 {
+					return NewString("null")
+				}
+				jsonText := vm.jsJSONStringify(args[0])
+				if !vm.jsEnsureStringSize(len(jsonText)) || !vm.jsChargeStringWork(len(jsonText)) {
+					return Value{Type: VTJSUndefined}
+				}
+				return NewString(jsonText)
+			}
+			return Value{Type: VTJSUndefined}
 		case "Set":
 			return vm.jsCallKeyedCollectionMethod(thisVal, "Set", vm.jsObjectStringProperty(callee, "name"), args)
 		case "Map":
@@ -9785,10 +10290,12 @@ func (vm *VM) jsCall(callee Value, thisVal Value, args []Value) Value {
 		}
 		return Value{Type: VTJSUndefined}
 	case VTNativeObject:
-		return vm.dispatchNativeCall(callee.Num, "", args)
+		return vm.jsDispatchNativeCall(callee.Num, "", args)
 	case VTJSObject:
 		ctorName := vm.jsObjectStringProperty(callee, "__js_ctor")
 		switch ctorName {
+		case "ActiveXObject":
+			return vm.jsDispatchNativeCall(nativeObjectServer, "CreateObject", args)
 		case "Function":
 			return vm.jsConstructFunction(args)
 		case "Object":
@@ -9884,6 +10391,10 @@ func (vm *VM) jsCall(callee Value, thisVal Value, args []Value) Value {
 			return NewString(jsEncodeURIValue(vm.valueToString(jsArgOrUndefined(args, 0)), false))
 		case "encodeURIComponent":
 			return NewString(jsEncodeURIValue(vm.valueToString(jsArgOrUndefined(args, 0)), true))
+		case "escape":
+			return NewString(jsEscapeValue(vm.valueToString(jsArgOrUndefined(args, 0))))
+		case "unescape":
+			return NewString(jsUnescapeValue(vm.valueToString(jsArgOrUndefined(args, 0))))
 		}
 		return Value{Type: VTJSUndefined}
 	case VTBuiltin:
@@ -9917,31 +10428,61 @@ func (vm *VM) jsThrow(v Value) {
 	if len(vm.jsTryStack) == 0 {
 		panic(&jsAsyncRejectionError{reason: v})
 	}
+	vm.jsThrowToActiveHandler(v)
+}
+
+func (vm *VM) jsThrowToActiveHandler(v Value) {
+	// Unwind function frames entered after the active handler. A throw from a
+	// synchronous callback may target a catch in its caller; executing that
+	// catch with the callback's fp/env makes caller locals read as undefined.
+	for len(vm.jsCallStack) > 0 {
+		frame := vm.jsCallStack[len(vm.jsCallStack)-1]
+		if frame.tryDepth < len(vm.jsTryStack) {
+			break
+		}
+		currentEnvID := vm.jsActiveEnvID
+		vm.jsCallStack = vm.jsCallStack[:len(vm.jsCallStack)-1]
+		vm.jsReleaseEnvFrame(currentEnvID)
+		vm.jsActiveEnvID = frame.envID
+		vm.jsThisValue = frame.thisVal
+		vm.jsNewTarget = frame.newTarget
+		vm.jsStrictMode = frame.jsStrictMode
+		vm.jsBlockScopes = frame.savedBlockScopes
+		vm.jsBlockScopeConst = frame.savedBlockScopeConst
+		vm.jsBlockScopeTDZ = frame.savedBlockScopeTDZ
+		vm.jsBlockScopeDepth = frame.savedBlockScopeDepth
+		vm.fp = frame.savedFP
+		vm.sp = frame.savedSP
+	}
 	target := vm.jsTryStack[len(vm.jsTryStack)-1]
 	vm.jsTryStack = vm.jsTryStack[:len(vm.jsTryStack)-1]
 	vm.jsErrStack = append(vm.jsErrStack, v)
 	vm.ip = target
 }
 
-// jsRaiseRuntimeError raises an uncaught JavaScript runtime error in ASP-compatible shape.
+// jsRaiseRuntimeError raises an uncaught runtime error exclusively for the JScript / JavaScript runtime.
+// It formats the error with Category "JScript runtime" and Source "JScript runtime error".
+// For VBScript runtime errors, DO NOT use this method; use vm.raise instead.
 func (vm *VM) jsRaiseRuntimeError(code jscript.JSSyntaxErrorCode, msg string) {
 	description := strings.TrimSpace(msg)
 	if description == "" {
 		description = code.String()
 	}
 
+	file, line, column := vm.mapRuntimeLocation(vm.lastLine, vm.lastColumn)
 	vbCode := vbscript.VBSyntaxErrorCode(code)
 	vme := &VMError{
 		Code:           vbCode,
-		Line:           vm.lastLine,
-		Column:         vm.lastColumn,
+		Line:           line,
+		Column:         column,
+		File:           file,
 		Msg:            description,
 		ASPCode:        int(code),
 		ASPDescription: description,
-		Category:       "JavaScript runtime",
+		Category:       "JScript runtime",
 		Description:    description,
 		Number:         jscript.HRESULTFromJScriptCode(code),
-		Source:         "JavaScript runtime error",
+		Source:         "JScript runtime error",
 	}
 
 	vm.errSetFromVMError(vme)
@@ -9955,16 +10496,95 @@ func (vm *VM) jsRaiseRuntimeError(code jscript.JSSyntaxErrorCode, msg string) {
 	panic(vme)
 }
 
+// jsHandleNativeError handles errors produced by native call dispatches during JScript execution.
+// If a JScript try/catch block is active, it catches the exception and transfers control to the catch handler.
+// Otherwise, it raises a JScript runtime error in ASP-compatible format.
+func (vm *VM) jsHandleNativeError(hresult int, errMsg string, vme *VMError) {
+	if len(vm.jsTryStack) > 0 {
+		errObj := vm.jsCreateErrorObject("Error", errMsg)
+		if items, ok := vm.jsObjectItems[errObj.Num]; ok && items != nil {
+			items["number"] = NewInteger(int64(hresult))
+		}
+		vm.jsThrowToActiveHandler(errObj)
+		return
+	}
+
+	line := vm.lastLine
+	col := vm.lastColumn
+	filePath := ""
+	if vme != nil {
+		if line == 0 {
+			line = vme.Line
+		}
+		if col == 0 {
+			col = vme.Column
+		}
+		filePath = vme.File
+	}
+	if filePath == "" {
+		filePath, line, col = vm.mapRuntimeLocation(line, col)
+	}
+
+	description := errMsg
+	if description == "" && vme != nil {
+		description = vme.Msg
+	}
+
+	code := vbscript.ActiveXCannotCreateObject
+	if vme != nil {
+		code = vme.Code
+	}
+
+	vmeJS := &VMError{
+		Code:           code,
+		Line:           line,
+		Column:         col,
+		File:           filePath,
+		Msg:            description,
+		ASPCode:        int(code),
+		ASPDescription: description,
+		Category:       "JScript runtime",
+		Description:    description,
+		Number:         hresult,
+		Source:         "JScript runtime error",
+	}
+
+	vm.errSetFromVMError(vmeJS)
+	panic(vmeJS)
+}
+
+// jsDispatchNativeCall executes a native object method call on behalf of JScript.
+// If a panic occurs during native dispatch (e.g. invalid class string 0x800401F3 from Server.CreateObject),
+// it intercepts the error and routes it through JScript exception handling or telemetry.
+func (vm *VM) jsDispatchNativeCall(targetID int64, member string, args []Value) (res Value) {
+	defer func() {
+		if r := recover(); r != nil {
+			if vme, ok := r.(*VMError); ok {
+				hresult := vme.Number
+				if hresult == 0 {
+					hresult = asp.InvalidProgIDHRESULT
+				}
+				errMsg := vme.Msg
+				if vme.Code == vbscript.ActiveXCannotCreateObject || strings.EqualFold(member, "CreateObject") {
+					errMsg = "Invalid class string"
+				}
+				vm.jsHandleNativeError(hresult, errMsg, vme)
+				res = Value{Type: VTJSUndefined}
+				return
+			}
+			panic(r)
+		}
+	}()
+	return vm.dispatchNativeCall(targetID, member, args)
+}
+
 // jsThrowError throws a standard JScript Error that can be caught by a JS try/catch.
 func (vm *VM) jsThrowError(msg string) {
 	if len(vm.jsTryStack) == 0 {
 		vm.jsRaiseRuntimeError(jscript.InternalError, msg)
 		return
 	}
-	target := vm.jsTryStack[len(vm.jsTryStack)-1]
-	vm.jsTryStack = vm.jsTryStack[:len(vm.jsTryStack)-1]
-	vm.jsErrStack = append(vm.jsErrStack, vm.jsCreateErrorObject("Error", msg))
-	vm.ip = target
+	vm.jsThrowToActiveHandler(vm.jsCreateErrorObject("Error", msg))
 }
 
 // jsThrowTypeError throws a JScript TypeError that can be caught by a JS try/catch.
@@ -9974,10 +10594,7 @@ func (vm *VM) jsThrowTypeError(msg string) {
 		vm.jsRaiseRuntimeError(jscript.TypeMismatch, msg)
 		return
 	}
-	target := vm.jsTryStack[len(vm.jsTryStack)-1]
-	vm.jsTryStack = vm.jsTryStack[:len(vm.jsTryStack)-1]
-	vm.jsErrStack = append(vm.jsErrStack, vm.jsCreateErrorObject("TypeError", msg))
-	vm.ip = target
+	vm.jsThrowToActiveHandler(vm.jsCreateErrorObject("TypeError", msg))
 }
 
 // jsThrowJSError throws a specific JScript error code.
@@ -9987,10 +10604,17 @@ func (vm *VM) jsThrowJSError(code jscript.JSSyntaxErrorCode) {
 		vm.jsRaiseRuntimeError(code, msg)
 		return
 	}
-	target := vm.jsTryStack[len(vm.jsTryStack)-1]
-	vm.jsTryStack = vm.jsTryStack[:len(vm.jsTryStack)-1]
-	vm.jsErrStack = append(vm.jsErrStack, vm.jsCreateErrorObject("TypeError", msg)) // Most ES6+ errors are TypeErrors
-	vm.ip = target
+	ctorName := "TypeError"
+	if code == jscript.SyntaxError {
+		ctorName = "SyntaxError"
+	} else if code == jscript.UndefinedIdentifier {
+		ctorName = "ReferenceError"
+	}
+	errObj := vm.jsCreateErrorObject(ctorName, msg)
+	if items, ok := vm.jsObjectItems[errObj.Num]; ok && items != nil {
+		items["number"] = NewInteger(int64(jscript.HRESULTFromJScriptCode(code)))
+	}
+	vm.jsThrowToActiveHandler(errObj)
 }
 
 // jsThrowReferenceError throws a JScript ReferenceError that can be caught by a JS try/catch.
@@ -10000,10 +10624,7 @@ func (vm *VM) jsThrowReferenceError(msg string) {
 		vm.jsRaiseRuntimeError(jscript.UndefinedIdentifier, msg)
 		return
 	}
-	target := vm.jsTryStack[len(vm.jsTryStack)-1]
-	vm.jsTryStack = vm.jsTryStack[:len(vm.jsTryStack)-1]
-	vm.jsErrStack = append(vm.jsErrStack, vm.jsCreateErrorObject("ReferenceError", msg))
-	vm.ip = target
+	vm.jsThrowToActiveHandler(vm.jsCreateErrorObject("ReferenceError", msg))
 }
 
 // jsToNumber converts a Value to a numeric value (VTDouble) following JScript semantics.
@@ -10110,10 +10731,18 @@ func (vm *VM) jsToString(v Value) string {
 	if v.Type == VTArgRef {
 		v = vm.stack[int(v.Num)]
 	}
+	// ADODB Field proxies expose their Value property as the default member.
+	// Resolve it before JScript coercion so SQL NULL follows String(null) and
+	// becomes lowercase "null", rather than the VB-style "Null" text.
+	if v.Type == VTNativeObject {
+		if fieldValue, handled := vm.dispatchADODBFieldPropertyGet(v.Num, "__default__"); handled {
+			return vm.jsToString(fieldValue)
+		}
+	}
 	switch v.Type {
-	case VTJSUndefined:
+	case VTJSUndefined, VTEmpty:
 		return "undefined"
-	case VTNull, VTEmpty:
+	case VTNull:
 		return "null"
 	case VTBool:
 		if v.Num != 0 {
@@ -10158,13 +10787,31 @@ func (vm *VM) jsToString(v Value) string {
 }
 
 func (vm *VM) jsToNumber(v Value) Value {
+	// Request("name") returns an ASP collection-value wrapper. JScript numeric
+	// coercion must use its default string value; a missing key remains Empty
+	// and therefore converts to NaN rather than zero.
+	if v.Type == VTNativeObject {
+		if collectionValue, exists := vm.requestCollectionValueItems[v.Num]; exists {
+			if len(collectionValue.Values) == 0 {
+				return NewDouble(math.NaN())
+			}
+			return vm.jsToNumber(NewString(collectionValue.Joined()))
+		}
+	}
+	// ADODB Field proxies expose Value as their default member. Numeric JScript
+	// coercion must resolve that member just as string coercion does.
+	if v.Type == VTNativeObject {
+		if fieldValue, handled := vm.dispatchADODBFieldPropertyGet(v.Num, "__default__"); handled {
+			return vm.jsToNumber(fieldValue)
+		}
+	}
 	switch v.Type {
 	case VTJSBigInt:
 		vm.jsThrowTypeError("Cannot convert a BigInt value to a number")
 		return NewDouble(math.NaN())
-	case VTJSUndefined:
+	case VTJSUndefined, VTEmpty:
 		return NewDouble(math.NaN())
-	case VTNull, VTEmpty:
+	case VTNull:
 		return NewDouble(0)
 	case VTInteger:
 		return Value{Type: VTDouble, Flt: float64(v.Num)}
@@ -10727,7 +11374,10 @@ func (vm *VM) jsConstructFunction(args []Value) Value {
 	compiler := NewASPCompiler("")
 	compiler.sourceName = vm.sourceName
 	vm.jsPrepareDynamicCompilerIC(compiler)
-	compiler.compileJScriptEvalSnippet(code)
+	if err := compiler.compileJScriptEvalSnippet(code); err != nil {
+		vm.jsThrowJSError(jscript.SyntaxError)
+		return Value{Type: VTJSUndefined}
+	}
 	if len(compiler.bytecode) == 0 {
 		return Value{Type: VTJSUndefined}
 	}
@@ -10736,7 +11386,7 @@ func (vm *VM) jsConstructFunction(args []Value) Value {
 	if startIP < 0 || startIP >= len(vm.bytecode) {
 		return Value{Type: VTJSUndefined}
 	}
-	child := vm.cloneForExecuteLocal(startIP)
+	child := vm.cloneForExecuteLocalSharedRuntime(startIP)
 	if err := child.Run(); err != nil {
 		vm.syncExecuteGlobalState(child)
 		if vmErr, ok := err.(*VMError); ok {
@@ -10802,6 +11452,8 @@ func (vm *VM) jsConstruct(constructor Value, args []Value, newTarget Value, isSu
 	if constructor.Type == VTJSObject || constructor.Type == VTJSFunction {
 		ctorName := vm.jsObjectStringProperty(constructor, "__js_ctor")
 		switch ctorName {
+		case "ActiveXObject":
+			return vm.jsDispatchNativeCall(nativeObjectServer, "CreateObject", args)
 		case "Function":
 			return vm.jsConstructFunction(args)
 		case "Object":
@@ -11516,6 +12168,9 @@ func (vm *VM) jsRegExpExec(reVal Value, input string) Value {
 	resID := vm.allocJSID()
 	res := make(map[string]Value)
 	res["__js_type"] = NewString("Array")
+	if proto := vm.jsGetIntrinsicPrototype("Array"); proto.Type == VTJSObject {
+		res["__js_proto"] = proto
+	}
 	// JScript index is the start of the match in UTF-16.
 	matchStartUTF16 := int64(0)
 	currentRuneIdx = 0
@@ -11542,12 +12197,12 @@ func (vm *VM) jsRegExpExec(reVal Value, input string) Value {
 			vals[i] = NewString(g.String())
 		}
 	}
-	vm.jsObjectItems[resID] = res
-	vm.jsObjectSlots[resID] = vals
 	res["length"] = NewInteger(int64(len(vals)))
 	for i, v := range vals {
 		res[strconv.Itoa(i)] = v
 	}
+	vm.jsObjectItems[resID] = res
+	vm.jsObjectSlots[resID] = vals
 
 	// Named capture groups (ES2018)
 	var groupsObj map[string]Value
@@ -11572,7 +12227,128 @@ func (vm *VM) jsRegExpExec(reVal Value, input string) Value {
 		res["groups"] = Value{Type: VTJSUndefined}
 	}
 
+	vm.jsUpdateRegExpStaticProperties(input, m)
 	return Value{Type: VTJSObject, Num: resID}
+}
+
+func (vm *VM) jsUpdateRegExpStaticProperties(input string, m *regexp2.Match) {
+	if m == nil {
+		return
+	}
+	regExpCtor := vm.jsGetName("RegExp")
+	if regExpCtor.Type != VTJSObject && regExpCtor.Type != VTJSFunction {
+		return
+	}
+
+	groups := m.Groups()
+	fullMatch := m.String()
+
+	dollar1, dollar2, dollar3, dollar4, dollar5, dollar6, dollar7, dollar8, dollar9 := "", "", "", "", "", "", "", "", ""
+	for i := 1; i <= 9; i++ {
+		val := ""
+		if i < len(groups) && groups[i].Capture.Length >= 0 {
+			val = groups[i].String()
+		}
+		switch i {
+		case 1:
+			dollar1 = val
+		case 2:
+			dollar2 = val
+		case 3:
+			dollar3 = val
+		case 4:
+			dollar4 = val
+		case 5:
+			dollar5 = val
+		case 6:
+			dollar6 = val
+		case 7:
+			dollar7 = val
+		case 8:
+			dollar8 = val
+		case 9:
+			dollar9 = val
+		}
+	}
+
+	lastParen := ""
+	for i := len(groups) - 1; i >= 1; i-- {
+		if groups[i].Capture.Length >= 0 {
+			lastParen = groups[i].String()
+			break
+		}
+	}
+
+	startByte := vm.jsRuneToByteOffset(input, m.Index)
+	lengthByte := vm.jsRuneToByteOffset(input[startByte:], m.Length)
+	leftContext := input[:startByte]
+	rightContext := input[startByte+lengthByte:]
+
+	vm.jsMemberSet(regExpCtor, "$1", NewString(dollar1))
+	vm.jsMemberSet(regExpCtor, "$2", NewString(dollar2))
+	vm.jsMemberSet(regExpCtor, "$3", NewString(dollar3))
+	vm.jsMemberSet(regExpCtor, "$4", NewString(dollar4))
+	vm.jsMemberSet(regExpCtor, "$5", NewString(dollar5))
+	vm.jsMemberSet(regExpCtor, "$6", NewString(dollar6))
+	vm.jsMemberSet(regExpCtor, "$7", NewString(dollar7))
+	vm.jsMemberSet(regExpCtor, "$8", NewString(dollar8))
+	vm.jsMemberSet(regExpCtor, "$9", NewString(dollar9))
+
+	vm.jsMemberSet(regExpCtor, "input", NewString(input))
+	vm.jsMemberSet(regExpCtor, "$_", NewString(input))
+
+	vm.jsMemberSet(regExpCtor, "lastMatch", NewString(fullMatch))
+	vm.jsMemberSet(regExpCtor, "$&", NewString(fullMatch))
+
+	vm.jsMemberSet(regExpCtor, "lastParen", NewString(lastParen))
+	vm.jsMemberSet(regExpCtor, "$+", NewString(lastParen))
+
+	vm.jsMemberSet(regExpCtor, "leftContext", NewString(leftContext))
+	vm.jsMemberSet(regExpCtor, "$`", NewString(leftContext))
+
+	vm.jsMemberSet(regExpCtor, "rightContext", NewString(rightContext))
+	vm.jsMemberSet(regExpCtor, "$'", NewString(rightContext))
+}
+
+func (vm *VM) jsGetFunctionCaller(target Value) Value {
+	if len(vm.jsCallStack) == 0 {
+		return NewNull()
+	}
+	isIntrinsicFunctionCtor := false
+	if target.Type == VTJSObject || target.Type == VTJSFunction {
+		if ctor := vm.jsGetName("Function"); ctor.Type == target.Type && ctor.Num == target.Num {
+			isIntrinsicFunctionCtor = true
+		}
+	}
+	if isIntrinsicFunctionCtor {
+		if len(vm.jsCallStack) >= 2 {
+			callerFn := vm.jsCallStack[len(vm.jsCallStack)-2].fn
+			if callerFn.Type == VTJSFunction {
+				return callerFn
+			}
+		}
+		return NewNull()
+	}
+
+	for i, v := range slices.Backward(vm.jsCallStack) {
+		frameFn := v.fn
+		if frameFn.Type == target.Type && frameFn.Num == target.Num {
+			if i > 0 {
+				callerFn := vm.jsCallStack[i-1].fn
+				if callerFn.Type == VTJSFunction {
+					return callerFn
+				}
+			}
+			return NewNull()
+		}
+	}
+	if len(vm.jsCallStack) >= 2 {
+		callerFn := vm.jsCallStack[len(vm.jsCallStack)-2].fn
+		if callerFn.Type == VTJSFunction {
+			return callerFn
+		}
+	}
+	return NewNull()
 }
 
 func (vm *VM) jsRuneToByteOffset(s string, runeIdx int) int {

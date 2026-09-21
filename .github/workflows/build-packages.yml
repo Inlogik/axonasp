@@ -43,7 +43,7 @@ jobs:
       version: ${{ steps.version.outputs.value }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Compute version string
@@ -74,10 +74,10 @@ jobs:
           - { goos: freebsd, goarch: amd64 }
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -117,9 +117,11 @@ jobs:
           build_one "axonasp-admin$EXT"     admin
           build_one "axonasp-service$EXT"   service
           build_one "axonasp-testsuite$EXT" testsuite
-          # Build axonhta — output to .tmp first to avoid collision with
-          # the existing ./axonhta/ source directory.
+          # Build axonhta — output to .tmp first to avoid Go placing the
+          # binary inside the ./axonhta/ source directory, then remove the
+          # stale directory before renaming so mv doesn't descend into it.
           go build -trimpath -ldflags "${HTA_LDFLAGS}" -o "axonhta${EXT}.tmp" ./axonhta
+          rm -rf "axonhta${EXT}" 2>/dev/null || true
           mv "axonhta${EXT}.tmp" "axonhta${EXT}"
           if [ "${GOOS}" != "windows" ]; then build_one "axonasp-fpm" fpm; fi
 
@@ -138,8 +140,8 @@ jobs:
           pushd caddy
           rm -f caddy caddy.exe
           xcaddy build \
-            --with g3pix.com.br/axonasp/caddy=. \
-            --replace "g3pix.com.br/axonasp=${GITHUB_WORKSPACE}" \
+            --with g3pix.com.br/axonasp/v2/caddy=. \
+            --replace "g3pix.com.br/axonasp/v2=${GITHUB_WORKSPACE}" \
             --replace "github.com/google/cel-go=github.com/google/cel-go@v0.20.1"
           popd
 
@@ -239,6 +241,8 @@ jobs:
           for packager in deb rpm apk; do
             nfpm package --config nfpm-caddy.yaml --packager "${packager}" --target .
           done
+          # Move packages to workspace root so upload-artifact globs find them
+          mv ./*.deb ./*.rpm ./*.apk ../
           popd
 
       # ──────────────────────────────────────────────────────────────
@@ -294,7 +298,7 @@ jobs:
           tar -cJf "axonasp-freebsd-${VERSION}-${ARCH}.tar.xz" "${STAGE}/"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: axonasp-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
@@ -315,10 +319,10 @@ jobs:
       contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -344,7 +348,7 @@ jobs:
           zip -r "axonasp-wasm-${VERSION}.zip" "${STAGE}/"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: axonasp-wasm
           path: "*.zip"
@@ -358,10 +362,10 @@ jobs:
       contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Download Windows binaries from build job
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: axonasp-windows-amd64
           path: .
@@ -391,7 +395,7 @@ jobs:
         shell: pwsh
 
       - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: axonasp-installer-amd64
           path: installer-src\Output\*.exe
@@ -405,10 +409,10 @@ jobs:
       contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Download macOS binaries from build job
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: axonasp-darwin-arm64
           path: .
@@ -461,7 +465,7 @@ jobs:
           fi
 
       - name: Upload pkg artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: axonasp-macos-pkg-arm64
           path: "*.pkg"
@@ -476,16 +480,16 @@ jobs:
       contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
       - name: Flatten artifacts for release
         run: |
           mkdir -p release-assets
-          find artifacts -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.apk" -o -name "*.pkg.tar.zst" -o -name "*.zip" -o -name "*.tar.xz" -o -name "*.pkg" -o -name "*.exe" \) -exec cp {} release-assets/ \;
+          find artifacts -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.apk" -o -name "*.pkg.tar.zst" -o -name "*.zip" -o -name "*.tar.gz" -o -name "*.tar.xz" -o -name "*.pkg" -o -name "*.exe" \) -exec cp {} release-assets/ \;
 
       - name: Publish to GitHub Releases
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: release-assets/*

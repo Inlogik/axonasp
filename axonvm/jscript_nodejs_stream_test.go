@@ -79,6 +79,26 @@ func TestJScriptStreamWritableCollect(t *testing.T) {
 	}
 }
 
+func TestJScriptStreamWritableEvents(t *testing.T) {
+	source := jscriptSrc(`
+		var stream = require("stream");
+		var w = new stream.Writable();
+		var events = "";
+		w.on("drain", function () { events += "drain|"; });
+		w.on("finish", function () { events += "finish"; });
+		w.write("ab");
+		w.end();
+		Response.Write(events);
+	`)
+	out, err := runJScript2(t, source)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != "drain|finish" {
+		t.Fatalf("expected stream events, got %q", out)
+	}
+}
+
 func TestJScriptStreamPipeReadableToWritable(t *testing.T) {
 	source := jscriptSrc(`
 		var stream = require("stream");

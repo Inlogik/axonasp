@@ -24,6 +24,7 @@ package axonvm
 
 import (
 	"bufio"
+	crand "crypto/rand"
 	"fmt"
 	"io"
 	"os"
@@ -33,7 +34,7 @@ import (
 	"strings"
 	"time"
 
-	"g3pix.com.br/axonasp/vbscript"
+	"g3pix.com.br/axonasp/v2/vbscript"
 	"github.com/shirou/gopsutil/v3/disk"
 )
 
@@ -394,7 +395,15 @@ func (vm *VM) dispatchFSORootMethod(_ *fsoNativeObject, member string, args []Va
 		}
 		return NewString(path)
 	case strings.EqualFold(member, "GetTempName"):
-		return NewString(fmt.Sprintf("rad%X.axon.tmp", time.Now().UnixNano()))
+		var b [4]byte
+		if _, err := crand.Read(b[:]); err != nil {
+			now := uint32(time.Now().UnixNano())
+			b[0] = byte(now >> 24)
+			b[1] = byte(now >> 16)
+			b[2] = byte(now >> 8)
+			b[3] = byte(now)
+		}
+		return NewString(fmt.Sprintf("rad%02X%02X%02X%02X.tmp", b[0], b[1], b[2], b[3]))
 	case strings.EqualFold(member, "GetDriveName"):
 		if len(args) < 1 {
 			return NewString("")
@@ -441,7 +450,11 @@ func (vm *VM) dispatchFSORootMethod(_ *fsoNativeObject, member string, args []Va
 		sourcePath, sourceOK := vm.fsoResolvePath(args[0].String())
 		destPath, destOK := vm.fsoResolvePath(args[1].String())
 		if sourceOK && destOK {
-			_ = vm.fsoMovePath(sourcePath, destPath)
+			finalDest := vm.fsoResolveMoveDestination(sourcePath, destPath)
+			if vm.fsoMovePath(sourcePath, finalDest) == nil {
+				globalFSOCache.Invalidate(sourcePath)
+				globalFSOCache.Invalidate(finalDest)
+			}
 		}
 		return Value{Type: VTEmpty}
 	case strings.EqualFold(member, "MoveFolder"):
@@ -451,7 +464,11 @@ func (vm *VM) dispatchFSORootMethod(_ *fsoNativeObject, member string, args []Va
 		sourcePath, sourceOK := vm.fsoResolvePath(args[0].String())
 		destPath, destOK := vm.fsoResolvePath(args[1].String())
 		if sourceOK && destOK {
-			_ = vm.fsoMovePath(sourcePath, destPath)
+			finalDest := vm.fsoResolveMoveDestination(sourcePath, destPath)
+			if vm.fsoMovePath(sourcePath, finalDest) == nil {
+				globalFSOCache.Invalidate(sourcePath)
+				globalFSOCache.Invalidate(finalDest)
+			}
 		}
 		return Value{Type: VTEmpty}
 	case strings.EqualFold(member, "CopyFile"):
@@ -480,7 +497,7 @@ func (vm *VM) dispatchFSORootMethod(_ *fsoNativeObject, member string, args []Va
 		}
 		path, ok := vm.fsoResolvePath(args[0].String())
 		if !ok {
-			return Value{Type: VTEmpty}
+			vm.raise(vbscript.PathNotFound, "Path not found")
 		}
 		overwrite := vm.fsoOverwriteDefault(args, 1, true)
 		flags := os.O_CREATE | os.O_WRONLY
@@ -513,7 +530,7 @@ func (vm *VM) dispatchFSORootMethod(_ *fsoNativeObject, member string, args []Va
 		}
 		stream := vm.fsoOpenTextStream(path, mode, create)
 		if stream == nil {
-			return Value{Type: VTEmpty}
+			vm.raise(vbscript.FileNotFound, "File not found")
 		}
 		return vm.newFSONativeObject(fsoKindTextStream, path, stream)
 	case strings.EqualFold(member, "GetSpecialFolder"):
@@ -521,9 +538,10 @@ func (vm *VM) dispatchFSORootMethod(_ *fsoNativeObject, member string, args []Va
 		if len(args) >= 1 {
 			folderType = vm.asInt(args[0])
 		}
+		var targetPath string
 		switch folderType {
 		case 2:
-			return NewString(os.TempDir())
+			targetPath = os.TempDir()
 		case 1:
 			if runtime.GOOS == "windows" {
 				systemRoot := strings.TrimSpace(os.Getenv("SystemRoot"))
@@ -533,10 +551,11 @@ func (vm *VM) dispatchFSORootMethod(_ *fsoNativeObject, member string, args []Va
 				if systemRoot == "" {
 					systemRoot = `C:\Windows`
 				}
-				return NewString(filepath.Join(systemRoot, "System32"))
+				targetPath = filepath.Join(systemRoot, "System32")
+			} else {
+				targetPath = "/usr/sbin"
 			}
-			return NewString("/usr/bin")
-		default:
+		default: // 0: WindowsFolder
 			if runtime.GOOS == "windows" {
 				windowsDir := strings.TrimSpace(os.Getenv("WINDIR"))
 				if windowsDir == "" {
@@ -545,10 +564,12 @@ func (vm *VM) dispatchFSORootMethod(_ *fsoNativeObject, member string, args []Va
 				if windowsDir == "" {
 					windowsDir = `C:\Windows`
 				}
-				return NewString(windowsDir)
+				targetPath = windowsDir
+			} else {
+				targetPath = "/usr/bin"
 			}
-			return NewString(string(os.PathSeparator))
 		}
+		return vm.newFSONativeObject(fsoKindFolder, targetPath, nil)
 	default:
 		return Value{Type: VTEmpty}
 	}
@@ -753,8 +774,14 @@ func (vm *VM) dispatchFSOFileMethod(obj *fsoNativeObject, member string, args []
 			return Value{Type: VTEmpty}
 		}
 		destination, ok := vm.fsoResolvePath(args[0].String())
-		if ok && vm.fsoMovePath(obj.path, destination) == nil {
-			obj.path = destination
+		if ok {
+			finalDest := vm.fsoResolveMoveDestination(obj.path, destination)
+			if vm.fsoMovePath(obj.path, finalDest) == nil {
+				oldPath := obj.path
+				obj.path = finalDest
+				globalFSOCache.Invalidate(oldPath)
+				globalFSOCache.Invalidate(finalDest)
+			}
 		}
 		return Value{Type: VTEmpty}
 	case strings.EqualFold(member, "Copy"):
@@ -787,7 +814,10 @@ func (vm *VM) dispatchFSOFileMethod(obj *fsoNativeObject, member string, args []
 		parentPath := filepath.Dir(obj.path)
 		destination := filepath.Join(parentPath, newName)
 		if vm.fsoMovePath(obj.path, destination) == nil {
+			oldPath := obj.path
 			obj.path = destination
+			globalFSOCache.Invalidate(oldPath)
+			globalFSOCache.Invalidate(destination)
 		}
 		return Value{Type: VTEmpty}
 	default:
@@ -806,8 +836,14 @@ func (vm *VM) dispatchFSOFolderMethod(obj *fsoNativeObject, member string, args 
 			return Value{Type: VTEmpty}
 		}
 		destination, ok := vm.fsoResolvePath(args[0].String())
-		if ok && vm.fsoMovePath(obj.path, destination) == nil {
-			obj.path = destination
+		if ok {
+			finalDest := vm.fsoResolveMoveDestination(obj.path, destination)
+			if vm.fsoMovePath(obj.path, finalDest) == nil {
+				oldPath := obj.path
+				obj.path = finalDest
+				globalFSOCache.Invalidate(oldPath)
+				globalFSOCache.Invalidate(finalDest)
+			}
 		}
 		return Value{Type: VTEmpty}
 	case strings.EqualFold(member, "Copy"):
@@ -852,7 +888,10 @@ func (vm *VM) dispatchFSOFolderMethod(obj *fsoNativeObject, member string, args 
 		parentPath := filepath.Dir(obj.path)
 		destination := filepath.Join(parentPath, newName)
 		if vm.fsoMovePath(obj.path, destination) == nil {
+			oldPath := obj.path
 			obj.path = destination
+			globalFSOCache.Invalidate(oldPath)
+			globalFSOCache.Invalidate(destination)
 		}
 		return Value{Type: VTEmpty}
 	default:
@@ -921,7 +960,13 @@ func (vm *VM) fsoReleasePathObjects(path string) {
 func (vm *VM) fsoRemoveWithRetry(path string, recursive bool) error {
 	var lastErr error
 	for range 5 {
-		_ = os.Chmod(path, 0666)
+		if st, err := os.Stat(path); err == nil {
+			if st.IsDir() {
+				_ = os.Chmod(path, 0777)
+			} else {
+				_ = os.Chmod(path, 0666)
+			}
+		}
 		if recursive {
 			lastErr = os.RemoveAll(path)
 		} else {
@@ -935,6 +980,17 @@ func (vm *VM) fsoRemoveWithRetry(path string, recursive bool) error {
 		time.Sleep(15 * time.Millisecond)
 	}
 	return lastErr
+}
+
+// fsoResolveMoveDestination calculates final target path when destination is a folder or path separator.
+func (vm *VM) fsoResolveMoveDestination(sourcePath, destinationPath string) string {
+	if strings.HasSuffix(destinationPath, string(os.PathSeparator)) || strings.HasSuffix(destinationPath, "/") || strings.HasSuffix(destinationPath, "\\") {
+		return filepath.Join(destinationPath, filepath.Base(sourcePath))
+	}
+	if info, err := os.Stat(destinationPath); err == nil && info.IsDir() {
+		return filepath.Join(destinationPath, filepath.Base(sourcePath))
+	}
+	return destinationPath
 }
 
 // fsoMovePath moves one file or folder path and replaces an existing destination
@@ -1450,6 +1506,10 @@ func (vm *VM) fsoResolvePath(path string) (string, bool) {
 	if trimmed == "" {
 		return "", false
 	}
+	// Classic ASP applications commonly construct filesystem paths with the
+	// Windows separator. Treat it as a separator on every supported host before
+	// resolving and sandboxing the path.
+	trimmed = strings.ReplaceAll(trimmed, "\\", string(os.PathSeparator))
 
 	rootPath := vm.host.Server().MapPath("/")
 	currentDir := ""

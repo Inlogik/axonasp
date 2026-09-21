@@ -27,19 +27,24 @@ import (
 	"math"
 	"math/big"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
-	"g3pix.com.br/axonasp/jscript"
-	jsast "g3pix.com.br/axonasp/jscript/ast"
-	jsparser "g3pix.com.br/axonasp/jscript/parser"
-	jstoken "g3pix.com.br/axonasp/jscript/token"
-	jsunistring "g3pix.com.br/axonasp/jscript/unistring"
+	"g3pix.com.br/axonasp/v2/jscript"
+	jsast "g3pix.com.br/axonasp/v2/jscript/ast"
+	jsparser "g3pix.com.br/axonasp/v2/jscript/parser"
+	jstoken "g3pix.com.br/axonasp/v2/jscript/token"
+	jsunistring "g3pix.com.br/axonasp/v2/jscript/unistring"
 )
 
-var jscriptCallAssignmentAnchorPattern = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\(\s*((?:"[^"]*"|'[^']*'|[^'")\s]+)(?:\s*,\s*(?:"[^"]*"|'[^']*'|[^'")\s]+))*)\s*\)\s*=\s+([^;\r\n]+);`)
+var jscriptDynamicCollectionAssignmentAnchorPattern = regexp.MustCompile(`^(Application|Session|Response\.Cookies)\s*\(\s*(.*)\s*\)\s*=\s+([^;\r\n]+);`)
+var jscriptCallAssignmentAnchorPattern = regexp.MustCompile(`^([A-Za-z_$][A-Za-z0-9_$.]*)\s*\(\s*((?:"[^"]*"|'[^']*'|[^'")\s]+)(?:\s*,\s*(?:"[^"]*"|'[^']*'|[^'")\s]+))*)\s*\)\s*=\s+([^;\r\n]+);`)
+var jscriptQualifiedFunctionPattern = regexp.MustCompile(`\bfunction\s+([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+)\s*\(`)
+var jscriptArgumentsIdentifierPattern = regexp.MustCompile(`\barguments\b`)
 
 const jsRestParamTemplatePrefix = "__js_rest__:"
+const jsLocalNameTemplatePrefix = "__js_local_name__:"
 
 func normalizeJScriptCompileLineAnchors(anchors []jscriptCompileLineAnchor) []jscriptCompileLineAnchor {
 	if len(anchors) == 0 {
@@ -68,8 +73,8 @@ func (c *Compiler) mapJScriptParseLineToMerged(line int) int {
 	if c == nil || line <= 0 || len(c.jsCompileLineAnchors) == 0 {
 		return line
 	}
-	for i := len(c.jsCompileLineAnchors) - 1; i >= 0; i-- {
-		anchor := c.jsCompileLineAnchors[i]
+	for _, anchor := range slices.Backward(c.jsCompileLineAnchors) {
+
 		if line < anchor.GeneratedLineStart {
 			continue
 		}
@@ -91,7 +96,9 @@ func (c *Compiler) compileJScriptBlockWithLineAnchors(source string, anchors []j
 	// Classic ASP JScript commonly uses indexed default-property assignment syntax
 	// like Session("key") = value; normalize it into Session("key", value);
 	// so the GoJa parser accepts it and dispatchNativeCall(member="") can execute it.
+	source = normalizeJScriptStringContinuations(source)
 	source = normalizeJScriptCollectionAssignments(source)
+	source = normalizeJScriptQualifiedFunctionDeclarations(source)
 
 	prevAnchors := c.jsCompileLineAnchors
 	c.jsCompileLineAnchors = normalizeJScriptCompileLineAnchors(anchors)
@@ -109,6 +116,12 @@ func (c *Compiler) compileJScriptBlockWithLineAnchors(source string, anchors []j
 	if err != nil {
 		panic(c.newJScriptCompileErrorFromParse(err, "jscript parse error"))
 	}
+
+	prevFile := c.jsCurrentFile
+	c.jsCurrentFile = program.File
+	defer func() {
+		c.jsCurrentFile = prevFile
+	}()
 
 	prevLocalEnabled := c.jsLocalEnabled
 	prevLocalSlotCount := c.jsLocalSlotCount
@@ -183,18 +196,38 @@ func (c *Compiler) compileJScriptBlockWithLineAnchors(source string, anchors []j
 
 // compileJScriptEvalSnippet parses one JScript eval source and emits OpJS bytecode
 // that leaves the completion value on the stack and terminates with OpHalt.
-func (c *Compiler) compileJScriptEvalSnippet(source string) {
-	source = normalizeJScriptCollectionAssignments(source)
+func (c *Compiler) compileJScriptEvalSnippet(source string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if jsErr, ok := r.(*jscript.JSSyntaxError); ok {
+				err = jsErr
+			} else if compileErr, ok := r.(error); ok {
+				err = compileErr
+			} else {
+				err = fmt.Errorf("jscript eval compile panic: %v", r)
+			}
+		}
+	}()
 
-	program, err := jsparser.ParseFile(nil, c.sourceName, source, jsparser.ModeTopLevelAwait)
-	if err != nil {
-		panic(c.newJScriptCompileErrorFromParse(err, "jscript eval parse error"))
+	source = normalizeJScriptStringContinuations(source)
+	source = normalizeJScriptCollectionAssignments(source)
+	source = normalizeJScriptQualifiedFunctionDeclarations(source)
+
+	program, parseErr := jsparser.ParseFile(nil, c.sourceName, source, jsparser.ModeTopLevelAwait)
+	if parseErr != nil {
+		return c.newJScriptCompileErrorFromParse(parseErr, "jscript eval parse error")
 	}
+
+	prevFile := c.jsCurrentFile
+	c.jsCurrentFile = program.File
+	defer func() {
+		c.jsCurrentFile = prevFile
+	}()
 
 	if len(program.Body) == 0 {
 		c.emit(OpJSLoadUndefined)
 		c.emit(OpHalt)
-		return
+		return nil
 	}
 
 	// Detect "use strict" directive at the beginning
@@ -250,6 +283,7 @@ func (c *Compiler) compileJScriptEvalSnippet(source string) {
 
 	c.jsICNodeCount = c.jsNextICNodeID
 	c.emit(OpHalt)
+	return nil
 }
 
 // newJScriptCompileErrorFromParse converts parser failures into a JScript syntax error.
@@ -382,8 +416,8 @@ func (c *Compiler) jsSetLocalType(name string, t jsType) {
 	if !c.jsLocalEnabled {
 		return
 	}
-	for i := len(c.jsLocalScopeStack) - 1; i >= 0; i-- {
-		scope := c.jsLocalScopeStack[i]
+	for _, scope := range slices.Backward(c.jsLocalScopeStack) {
+
 		if _, exists := scope.entries[name]; exists {
 			scope.types[name] = t
 			return
@@ -395,8 +429,8 @@ func (c *Compiler) jsGetLocalType(name string) jsType {
 	if !c.jsLocalEnabled {
 		return jsTypeUnknown
 	}
-	for i := len(c.jsLocalScopeStack) - 1; i >= 0; i-- {
-		scope := c.jsLocalScopeStack[i]
+	for _, scope := range slices.Backward(c.jsLocalScopeStack) {
+
 		if t, exists := scope.types[name]; exists {
 			return t
 		}
@@ -462,8 +496,8 @@ func (c *Compiler) jsDeclareCurrentLocal(name string) int {
 }
 
 func (c *Compiler) jsHasFunctionLocalScope() bool {
-	for i := len(c.jsLocalScopeStack) - 1; i >= 0; i-- {
-		if c.jsLocalScopeStack[i].isFunction {
+	for _, v := range slices.Backward(c.jsLocalScopeStack) {
+		if v.isFunction {
 			return true
 		}
 	}
@@ -474,8 +508,8 @@ func (c *Compiler) jsResolveLocalSlot(name string) (int, bool) {
 	if !c.jsLocalEnabled {
 		return 0, false
 	}
-	for i := len(c.jsLocalScopeStack) - 1; i >= 0; i-- {
-		scope := c.jsLocalScopeStack[i]
+	for _, scope := range slices.Backward(c.jsLocalScopeStack) {
+
 		if slot, exists := scope.entries[name]; exists {
 			if slot < 0 {
 				return 0, false
@@ -524,8 +558,18 @@ func (c *Compiler) jsInferredType(expr jsast.Expression) jsType {
 }
 
 func (c *Compiler) compileJScriptStatement(stmt jsast.Statement) {
+	if c != nil && c.jsCurrentFile != nil && stmt != nil && stmt.Idx0() != 0 {
+		pos := c.jsCurrentFile.Position(int(stmt.Idx0()))
+		if pos.Line > 0 {
+			mappedLine := c.mapJScriptParseLineToMerged(pos.Line)
+			c.emitLine(mappedLine, pos.Column)
+		}
+	}
 	switch node := stmt.(type) {
 	case *jsast.ExpressionStatement:
+		if c.compileJScriptResponseWriteStatement(node.Expression) {
+			return
+		}
 		c.compileJScriptExpression(node.Expression)
 		c.emit(OpJSPop)
 	case *jsast.VariableStatement:
@@ -543,7 +587,9 @@ func (c *Compiler) compileJScriptStatement(stmt jsast.Statement) {
 					}
 				}
 			} else {
-				// var x; -> declare x
+				// var declarations were emitted by hoistJScriptDeclarations before
+				// statement execution. An uninitialized declaration has no runtime
+				// work, including when the same include declares it again.
 				if id, ok := binding.Target.(*jsast.Identifier); ok {
 					if slot, hasLocal := c.jsResolveLocalSlot(id.Name.String()); hasLocal {
 						_ = slot
@@ -554,8 +600,6 @@ func (c *Compiler) compileJScriptStatement(stmt jsast.Statement) {
 							continue
 						}
 					}
-					nameIdx := c.addConstant(NewString(id.Name.String()))
-					c.emit(OpJSDeclareName, nameIdx)
 				}
 			}
 		}
@@ -738,6 +782,38 @@ func (c *Compiler) compileJScriptStatement(stmt jsast.Statement) {
 	}
 }
 
+// compileJScriptResponseWriteStatement emits direct output opcodes for an
+// unshadowed Response.Write(value) expression statement. Classic ASP templates
+// generate this shape for both literal HTML and <%= expression %> blocks.
+// Keeping the optimization at statement level preserves the empty return value
+// semantics of Response.Write when it is used as part of a larger expression.
+func (c *Compiler) compileJScriptResponseWriteStatement(expr jsast.Expression) bool {
+	call, ok := expr.(*jsast.CallExpression)
+	if !ok || len(call.ArgumentList) != 1 {
+		return false
+	}
+	dot, ok := call.Callee.(*jsast.DotExpression)
+	if !ok || !strings.EqualFold(dot.Identifier.Name.String(), "Write") {
+		return false
+	}
+	target, ok := dot.Left.(*jsast.Identifier)
+	if !ok || !strings.EqualFold(target.Name.String(), "Response") {
+		return false
+	}
+	if _, shadowed := c.jsResolveLocalSlot(target.Name.String()); shadowed {
+		return false
+	}
+
+	if literal, ok := call.ArgumentList[0].(*jsast.StringLiteral); ok {
+		c.emit(OpWriteStatic, c.addConstant(NewString(literal.Value.String())))
+		return true
+	}
+
+	c.compileJScriptExpression(call.ArgumentList[0])
+	c.emitExt(ExtOpJSWrite)
+	return true
+}
+
 type jsUsingBinding struct {
 	name     string
 	symbolID int64
@@ -753,9 +829,9 @@ func jsStatementHasUsingDeclaration(stmts []jsast.Statement) bool {
 }
 
 func (c *Compiler) emitJScriptDisposeBindings(bindings []jsUsingBinding) {
-	for i := len(bindings) - 1; i >= 0; i-- {
-		nameIdx := c.addConstant(NewString(bindings[i].name))
-		symbolKey := jsSymbolPropertyPrefix + strconv.FormatInt(bindings[i].symbolID, 10)
+	for _, binding := range slices.Backward(bindings) {
+		nameIdx := c.addConstant(NewString(binding.name))
+		symbolKey := jsSymbolPropertyPrefix + strconv.FormatInt(binding.symbolID, 10)
 		symbolKeyIdx := c.addConstant(NewString(symbolKey))
 		c.emit(OpJSGetName, nameIdx)
 		c.emit(OpConstant, symbolKeyIdx)
@@ -1854,6 +1930,30 @@ func (c *Compiler) emitJSMemberSet(nameIdx int) {
 	c.emit(OpJSMemberSet, nameIdx, int(icID))
 }
 
+// emitJSMemberSetRetainValue performs one member assignment while leaving the
+// assigned (right-hand side) value on the stack, matching JavaScript
+// assignment-expression semantics: `obj.prop = value` evaluates to `value`.
+//
+// OpJSMemberSet pops both the target and the value and pushes nothing, so a
+// bare member-set used as an expression leaves no result. Identifier
+// assignments solve this with OpJSDup before the store; a member-set needs the
+// value duplicated below the target because the store consumes the top two
+// operands in [target, value] order.
+//
+// Stack before: [..., target, value]
+// Stack after:  [..., value]
+//
+// Sequence: value is duplicated (OpJSDup), then the top three entries are
+// rotated (OpJSRot 3) so one copy of value ends up under [target, value]; the
+// member-set then pops value + target and the retained copy is the expression
+// result. Without this, expression statements (which always emit OpJSPop)
+// underflow the operand stack at the root frame.
+func (c *Compiler) emitJSMemberSetRetainValue(nameIdx int) {
+	c.emit(OpJSDup)            // [..., target, value, value]
+	c.emit(OpJSRot, 3)         // [..., value, target, value]
+	c.emitJSMemberSet(nameIdx) // pops value + target, leaves [..., value]
+}
+
 func (c *Compiler) emitJSForIn(nameIdx int) int {
 	pos := len(c.bytecode)
 	c.bytecode = append(c.bytecode, byte(OpJSForIn), 0, 0, 0, 0, 0, 0)
@@ -2219,6 +2319,13 @@ func (c *Compiler) compileJScriptExpression(expr jsast.Expression) {
 		c.patchJSJump(jumpFalse)
 		c.compileJScriptExpression(node.Alternate)
 		c.patchJSJump(jumpEnd)
+	case *jsast.SequenceExpression:
+		for index, expression := range node.Sequence {
+			c.compileJScriptExpression(expression)
+			if index < len(node.Sequence)-1 {
+				c.emit(OpJSPop)
+			}
+		}
 	case *jsast.AwaitExpression:
 		if node.Argument != nil {
 			c.compileJScriptExpression(node.Argument)
@@ -2327,7 +2434,6 @@ func (c *Compiler) compileJScriptAssignment(node *jsast.AssignExpression) {
 			}
 			c.emit(OpJSDup)
 			c.emit(OpJSSetLocal, localSlot)
-			c.emit(OpJSLoadUndefined)
 			return
 		}
 		c.compileJScriptExpression(node.Right)
@@ -2344,22 +2450,16 @@ func (c *Compiler) compileJScriptAssignment(node *jsast.AssignExpression) {
 			c.emit(OpJSModuloAssign, nameIdx)
 		case jstoken.EXPONENT_ASSIGN, jstoken.EXPONENT:
 			c.emit(OpJSExponentAssign, nameIdx)
-			return
 		case jstoken.LOGICAL_AND_ASSIGN, jstoken.LOGICAL_AND:
 			c.emit(OpJSLogicalAndAssign, nameIdx)
-			return
 		case jstoken.LOGICAL_OR_ASSIGN, jstoken.LOGICAL_OR:
 			c.emit(OpJSLogicalOrAssign, nameIdx)
-			return
 		case jstoken.COALESCE_ASSIGN, jstoken.COALESCE:
 			c.emit(OpJSCoalesceAssign, nameIdx)
-			return
 		default:
 			c.emit(OpJSSetName, nameIdx)
 		}
-		// Compound assignments in AxonASP currently don't return the value on stack after OpJSXXXAssign?
-		// Let's check OpJSAddAssign etc.
-		c.emit(OpJSLoadUndefined)
+		return
 	case *jsast.ObjectPattern, *jsast.ArrayPattern:
 		if node.Operator != jstoken.ASSIGN {
 			jsErr := jscript.NewJSSyntaxError(jscript.IllegalAssignment, 0, 0)
@@ -2374,30 +2474,55 @@ func (c *Compiler) compileJScriptAssignment(node *jsast.AssignExpression) {
 	case *jsast.PrivateDotExpression:
 		c.compileJScriptExpression(left.Left)
 		c.compileJScriptExpression(node.Right)
-		c.emitJSMemberSet(c.addConstant(NewString("\x00__priv_" + left.Identifier.Name.String())))
-		c.emit(OpJSLoadUndefined)
+		c.emitJSMemberSetRetainValue(c.addConstant(NewString("\x00__priv_" + left.Identifier.Name.String())))
 	case *jsast.DotExpression:
 		if _, ok := left.Left.(*jsast.SuperExpression); ok {
+			// OpJSSuperMemberSet already pushes the assigned value back.
 			c.compileJScriptExpression(node.Right)
 			c.emit(OpJSSuperMemberSet, c.addConstant(NewString(left.Identifier.Name.String())))
 			return
 		}
 		c.compileJScriptExpression(left.Left)
+		if node.Operator != jstoken.ASSIGN {
+			c.emit(OpJSDup)
+			c.emitJSMemberGet(c.addConstant(NewString(left.Identifier.Name.String())))
+		}
 		c.compileJScriptExpression(node.Right)
-		c.emitJSMemberSet(c.addConstant(NewString(left.Identifier.Name.String())))
-		c.emit(OpJSLoadUndefined)
+		if node.Operator != jstoken.ASSIGN {
+			switch node.Operator {
+			case jstoken.ADD_ASSIGN, jstoken.PLUS:
+				c.emit(OpJSAdd)
+			case jstoken.SUBTRACT_ASSIGN, jstoken.MINUS:
+				c.emit(OpJSSubtract)
+			case jstoken.MULTIPLY_ASSIGN, jstoken.MULTIPLY:
+				c.emit(OpJSMultiply)
+			case jstoken.QUOTIENT_ASSIGN, jstoken.SLASH:
+				c.emit(OpJSDivide)
+			case jstoken.REMAINDER_ASSIGN, jstoken.REMAINDER:
+				c.emit(OpJSModulo)
+			case jstoken.EXPONENT_ASSIGN, jstoken.EXPONENT:
+				c.emit(OpJSExponent)
+			default:
+				c.emit(OpJSPop)
+				c.emit(OpJSLoadUndefined)
+			}
+		}
+		c.emitJSMemberSetRetainValue(c.addConstant(NewString(left.Identifier.Name.String())))
 	case *jsast.BracketExpression:
 		if _, ok := left.Left.(*jsast.SuperExpression); ok {
+			// OpJSSuperIndexSet already pushes the assigned value back.
 			c.compileJScriptExpression(node.Right)
 			c.compileJScriptExpression(left.Member)
 			c.emit(OpJSSuperIndexSet)
 			return
 		}
+		// OpJSIndexSet pops key + target + value, so duplicate the value before
+		// the target/key are evaluated so one copy survives as the expression result.
 		c.compileJScriptExpression(node.Right)
+		c.emit(OpJSDup)
 		c.compileJScriptExpression(left.Left)
 		c.compileJScriptExpression(left.Member)
 		c.emit(OpJSIndexSet)
-		c.emit(OpJSLoadUndefined)
 	case *jsast.CallExpression:
 		switch callee := left.Callee.(type) {
 		case *jsast.Identifier:
@@ -2787,6 +2912,13 @@ func (c *Compiler) compileJScriptCall(node *jsast.CallExpression) {
 					}
 					return
 				}
+			case "pow":
+				if len(node.ArgumentList) == 2 {
+					c.compileJScriptExpression(node.ArgumentList[0])
+					c.compileJScriptExpression(node.ArgumentList[1])
+					c.emitExt(ExtOpJSMathPow)
+					return
+				}
 			}
 		}
 
@@ -2825,6 +2957,24 @@ func (c *Compiler) compileJScriptTailReturn(argument jsast.Expression) bool {
 	callExpr, ok := argument.(*jsast.CallExpression)
 	if !ok {
 		return false
+	}
+	// A function literal passed to the tail callee captures the current
+	// activation. Reusing that activation would let the callee overwrite values
+	// observed by the captured closure.
+	for _, argument := range callExpr.ArgumentList {
+		switch argument.(type) {
+		case *jsast.FunctionLiteral, *jsast.ArrowFunctionLiteral:
+			return false
+		}
+	}
+	// Keep ordinary return-call semantics for Function.call/apply. These
+	// helpers invoke another function synchronously, and turning the helper
+	// itself into a tail call loses the wrapped result in nested calls.
+	if dot, ok := callExpr.Callee.(*jsast.DotExpression); ok {
+		member := dot.Identifier.Name.String()
+		if strings.EqualFold(member, "call") || strings.EqualFold(member, "apply") {
+			return false
+		}
 	}
 
 	switch callee := callExpr.Callee.(type) {
@@ -2938,6 +3088,14 @@ func (c *Compiler) compileJScriptFunctionLiteral(fn *jsast.FunctionLiteral, fall
 	c.emit(OpJSReturn)
 	bodyEnd := len(c.bytecode)
 	localCount := c.jsLocalSlotCount
+	localNames := make([]string, localCount)
+	for _, scope := range c.jsLocalScopeStack {
+		for localName, slot := range scope.entries {
+			if slot >= 0 && slot < localCount {
+				localNames[slot] = localName
+			}
+		}
+	}
 	if c.jsLocalEnabled {
 		c.jsPopLocalScope()
 	}
@@ -3028,8 +3186,16 @@ func (c *Compiler) compileJScriptFunctionLiteral(fn *jsast.FunctionLiteral, fall
 	if fn.Async {
 		params = append(params, jsAsyncFlag)
 	}
+	if fn.Source == "" || jscriptArgumentsIdentifierPattern.MatchString(fn.Source) {
+		params = append(params, jsUsesArgumentsFlag)
+	}
 	if localCount > 0 {
 		params = append(params, "__js_local_count__:"+strconv.Itoa(localCount))
+		for slot, localName := range localNames {
+			if localName != "" {
+				params = append(params, jsLocalNameTemplatePrefix+strconv.Itoa(slot)+":"+base64.StdEncoding.EncodeToString([]byte(localName)))
+			}
+		}
 	}
 	if fn.Source != "" {
 		params = append(params, jsFunctionSourceMetaPrefix+base64.StdEncoding.EncodeToString([]byte(fn.Source)))
@@ -3061,13 +3227,17 @@ func (c *Compiler) compileJScriptUpdateExpression(node *jsast.UnaryExpression) b
 			if isLocal {
 				if node.Postfix {
 					if !c.jsInGeneratorFunction {
+						// Postfix c++ evaluates to the OLD value: push it, then bump the slot.
+						// The pushed old value is the expression result consumed by the caller
+						// (an enclosing OpJSPop for expression statements). Do NOT pop it here.
 						c.emit(OpJSGetLocal, slot)
 						c.emit(OpJSIncLocal, slot)
-						c.emit(OpJSPop)
 						return true
 					}
 				} else {
+					// Prefix ++c evaluates to the NEW value: bump the slot, then push it.
 					c.emit(OpJSIncLocal, slot)
+					c.emit(OpJSGetLocal, slot)
 					return true
 				}
 			}
@@ -3081,12 +3251,14 @@ func (c *Compiler) compileJScriptUpdateExpression(node *jsast.UnaryExpression) b
 		case jstoken.DECREMENT:
 			if isLocal {
 				if node.Postfix {
+					// Postfix c-- evaluates to the OLD value: push it, then bump the slot.
 					c.emit(OpJSGetLocal, slot)
 					c.emit(OpJSDecLocal, slot)
-					c.emit(OpJSPop)
-				} else {
-					c.emit(OpJSDecLocal, slot)
+					return true
 				}
+				// Prefix --c evaluates to the NEW value: bump the slot, then push it.
+				c.emit(OpJSDecLocal, slot)
+				c.emit(OpJSGetLocal, slot)
 				return true
 			}
 			if node.Postfix {
@@ -3274,7 +3446,9 @@ func (c *Compiler) compileJScriptDestructuring(target jsast.Expression, isConst 
 					break
 				}
 			}
-			c.emit(OpJSDeclareName, nameIdx)
+			// The enclosing program/function hoist already emitted the binding.
+			// Keep the initializer store: repeated includes must still execute
+			// declaration initializers and any other executable side effects.
 			c.emit(OpJSSetName, nameIdx)
 		} else if isConst {
 			if c.jsLocalEnabled {
@@ -4019,6 +4193,9 @@ func normalizeJScriptCollectionAssignments(source string) string {
 					i += 2
 					continue
 				}
+				if source[i] == '\r' || source[i] == '\n' {
+					break
+				}
 				if source[i] == '"' {
 					result.WriteByte('"')
 					i++
@@ -4039,6 +4216,9 @@ func normalizeJScriptCollectionAssignments(source string) string {
 					result.WriteByte(source[i+1])
 					i += 2
 					continue
+				}
+				if source[i] == '\r' || source[i] == '\n' {
+					break
 				}
 				if source[i] == '\'' {
 					result.WriteByte('\'')
@@ -4071,9 +4251,20 @@ func normalizeJScriptCollectionAssignments(source string) string {
 			}
 			continue
 		}
+		// Check for backslash escape in general code context (e.g. inside regex literals like /\'/ or /\"/)
+		if source[i] == '\\' && i+1 < n {
+			result.WriteByte('\\')
+			result.WriteByte(source[i+1])
+			i += 2
+			continue
+		}
 
-		// Try matching anchored assignment pattern
-		if loc := jscriptCallAssignmentAnchorPattern.FindStringSubmatchIndex(source[i:]); loc != nil {
+		// Try matching anchored assignment pattern.
+		loc := jscriptDynamicCollectionAssignmentAnchorPattern.FindStringSubmatchIndex(source[i:])
+		if loc == nil {
+			loc = jscriptCallAssignmentAnchorPattern.FindStringSubmatchIndex(source[i:])
+		}
+		if loc != nil {
 			name := source[i+loc[2] : i+loc[3]]
 			args := source[i+loc[4] : i+loc[5]]
 			val := source[i+loc[6] : i+loc[7]]
@@ -4090,5 +4281,93 @@ func normalizeJScriptCollectionAssignments(source string) string {
 		result.WriteByte(source[i])
 		i++
 	}
+	return result.String()
+}
+
+// normalizeJScriptQualifiedFunctionDeclarations preserves the legacy
+// Microsoft JScript extension `function Object.method(...) { ... }` by
+// translating it to the equivalent property assignment before ES parsing.
+func normalizeJScriptQualifiedFunctionDeclarations(source string) string {
+	return jscriptQualifiedFunctionPattern.ReplaceAllString(source, `$1 = function(`)
+}
+
+// normalizeJScriptStringContinuations accepts the Microsoft JScript extension
+// that permits horizontal whitespace between a trailing backslash and the line
+// terminator. ECMAScript parsers require the line terminator to immediately
+// follow the backslash. Removing only that whitespace preserves line numbers
+// and the value of the resulting string.
+func normalizeJScriptStringContinuations(source string) string {
+	const (
+		jsCode = iota
+		jsSingleQuotedString
+		jsDoubleQuotedString
+		jsLineComment
+		jsBlockComment
+	)
+
+	var result strings.Builder
+	result.Grow(len(source))
+	state := jsCode
+
+	for i := 0; i < len(source); {
+		ch := source[i]
+		switch state {
+		case jsCode:
+			if ch == '\'' {
+				state = jsSingleQuotedString
+			} else if ch == '"' {
+				state = jsDoubleQuotedString
+			} else if ch == '/' && i+1 < len(source) && source[i+1] == '/' {
+				result.WriteString("//")
+				i += 2
+				state = jsLineComment
+				continue
+			} else if ch == '/' && i+1 < len(source) && source[i+1] == '*' {
+				result.WriteString("/*")
+				i += 2
+				state = jsBlockComment
+				continue
+			}
+		case jsSingleQuotedString, jsDoubleQuotedString:
+			quote := byte('\'')
+			if state == jsDoubleQuotedString {
+				quote = '"'
+			}
+			if ch == quote {
+				state = jsCode
+			} else if ch == '\\' {
+				j := i + 1
+				for j < len(source) && (source[j] == ' ' || source[j] == '\t' || source[j] == '\f' || source[j] == '\v') {
+					j++
+				}
+				if j < len(source) && (source[j] == '\r' || source[j] == '\n') {
+					result.WriteByte(ch)
+					i = j
+					continue
+				}
+				result.WriteByte(ch)
+				i++
+				if i < len(source) {
+					result.WriteByte(source[i])
+					i++
+				}
+				continue
+			}
+		case jsLineComment:
+			if ch == '\r' || ch == '\n' {
+				state = jsCode
+			}
+		case jsBlockComment:
+			if ch == '*' && i+1 < len(source) && source[i+1] == '/' {
+				result.WriteString("*/")
+				i += 2
+				state = jsCode
+				continue
+			}
+		}
+		result.WriteByte(ch)
+		i++
+	}
+
 	return result.String()
 }

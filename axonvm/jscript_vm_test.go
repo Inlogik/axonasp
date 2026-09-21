@@ -30,8 +30,8 @@ import (
 	"testing"
 	"time"
 
-	"g3pix.com.br/axonasp/jscript"
-	"g3pix.com.br/axonasp/vbscript"
+	"g3pix.com.br/axonasp/v2/jscript"
+	"g3pix.com.br/axonasp/v2/vbscript"
 )
 
 func runASPSourceForTest(t *testing.T, source string) string {
@@ -197,15 +197,15 @@ func TestJScriptResponseWriteFromScriptTag(t *testing.T) {
 	if err := compiler.Compile(); err != nil {
 		t.Fatalf("compile failed: %v", err)
 	}
-	containsJSOpcode := false
+	containsWriteOpcode := false
 	for i := 0; i < len(compiler.Bytecode()); i++ {
-		if OpCode(compiler.Bytecode()[i]) == OpJSCallMember {
-			containsJSOpcode = true
+		if OpCode(compiler.Bytecode()[i]) == OpWriteStatic {
+			containsWriteOpcode = true
 			break
 		}
 	}
-	if !containsJSOpcode {
-		t.Fatalf("expected OpJSCallMember in bytecode, got %v", compiler.Bytecode())
+	if !containsWriteOpcode {
+		t.Fatalf("expected direct OpWriteStatic in bytecode, got %v", compiler.Bytecode())
 	}
 	vm := NewVM(compiler.Bytecode(), compiler.Constants(), compiler.GlobalsCount())
 	if vm.Globals[0].Type != VTNativeObject {
@@ -1047,6 +1047,319 @@ func TestJScriptArgumentsThisCallAndApply(t *testing.T) {
 	}
 }
 
+func TestJScriptNestedFunctionApplyPreservesArguments(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`function format() { return arguments[0] + ":" + arguments[1] + ":" + arguments[2]; }` +
+		`function heading() { return format.apply(this, Array.prototype.slice.call(arguments, 0)); }` +
+		`Response.Write(heading("Sample Title", "", ""));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "Sample Title::" {
+		t.Fatalf("unexpected nested apply output: %q", out)
+	}
+}
+
+func TestJScriptApplyAfterArgumentsParameterMutation(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`function format() { return arguments[0] + ":" + arguments[1]; }` +
+		`function heading(source, value) { source = "changed"; return format.apply(this, Array.prototype.slice.call(arguments, 0)); }` +
+		`Response.Write(heading("original", "value"));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "changed:value" {
+		t.Fatalf("unexpected mutated-arguments apply output: %q", out)
+	}
+}
+
+func TestJScriptSliceReflectsMutatedParameter(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`function heading(source) { source = "changed"; return typeof Array.prototype.slice.call(arguments, 0)[0] + ":" + Array.prototype.slice.call(arguments, 0)[0]; }` +
+		`Response.Write(heading(function() {}));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "string:changed" {
+		t.Fatalf("unexpected sliced mutated parameter: %q", out)
+	}
+}
+
+func TestJScriptNestedApplyWithSlicedArgumentsAndLoop(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`function format() { for (var i = 1; i < arguments.length; i++) { arguments[0] = arguments[0].replace("{" + (i-1) + "}", arguments[i]); } return arguments[0]; }` +
+		`function heading(source, value) { source = "<{0}>"; return format.apply(this, Array.prototype.slice.call(arguments, 0)); }` +
+		`Response.Write(heading("ignored", "ok"));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "<ok>" {
+		t.Fatalf("unexpected nested sliced-arguments apply output: %q", out)
+	}
+}
+
+func TestJScriptArrayConstructorStringSupportsLegacyTypeChecks(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`var value = ["AQ"];` +
+		`var isObject = (typeof(value) === "object") ? value.constructor.toString().match(/object/i) !== null : false;` +
+		`var isArray = (typeof(value) === "object") ? value.constructor.toString().match(/array/i) !== null || value.length !== undefined : false;` +
+		`Response.Write(isObject + ":" + isArray + ":" + value.constructor.toString());` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "false:true:function Array() { [native code] }" {
+		t.Fatalf("array constructor string broke legacy type checks: %q", out)
+	}
+}
+
+func TestJScriptCallbackBooleanReturnInsideLoop(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`function Filter(items) { this.items = items; }` +
+		`Filter.prototype.select = function(predicate) {` +
+		` var out = new Array();` +
+		` for (var i = 0; i < this.items.length; i++) {` +
+		`  if (predicate.apply(this.items[i], [i])) out[out.length] = this.items[i];` +
+		` }` +
+		` return out;` +
+		`};` +
+		`var values = [{active:true}, {active:true}];` +
+		`Response.Write(new Filter(values).select(function() { return this.active; }).length);` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "2" {
+		t.Fatalf("callback boolean return was lost inside loop: %q", out)
+	}
+}
+
+func TestJScriptArrayLengthAppendByIndex(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`var out = new Array(); out[out.length] = "a"; out[out.length] = "b";` +
+		`Response.Write(out.length + ":" + out.join(","));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "2:a,b" {
+		t.Fatalf("array length append failed: %q", out)
+	}
+}
+
+func TestJScriptArrayLengthAssignmentTruncatesAndExtends(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`var values = ["first", "second"]; values.length = 1;` +
+		`var truncated = values.length + ":" + values.join(",");` +
+		`values.length = 3;` +
+		`Response.Write(truncated + ":" + values.length + ":" + typeof values[1] + ":" + typeof values[2]);` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "1:first:3:undefined:undefined" {
+		t.Fatalf("array length assignment did not truncate and extend correctly: %q", out)
+	}
+}
+
+func TestJScriptArrayRemoveByLengthAssignment(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`Array.prototype.removeAt = function(index) {` +
+		` var tail = this.slice(index + 1);` +
+		` this.length = index;` +
+		` return this.push.apply(this, tail);` +
+		`};` +
+		`var values = ["first"]; values.removeAt(0);` +
+		`Response.Write(values.length + ":" + values.join(","));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "0:" {
+		t.Fatalf("array remove using writable length failed: %q", out)
+	}
+}
+
+func TestJScriptDatePrototypeMethodReceivesEachCallArguments(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`Date.prototype.format = function(mask) { return mask; };` +
+		`var date = new Date(1353470340000);` +
+		`Response.Write(date.format("dd-MM-yyyy") + ":" + date.format("HH:mm"));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "dd-MM-yyyy:HH:mm" {
+		t.Fatalf("date prototype method reused an earlier call argument: %q", out)
+	}
+}
+
+func TestJScriptSessionObjectSurvivesAcrossVMs(t *testing.T) {
+	first := NewVM(nil, nil, 5)
+	storedValue := first.valueToApplicationValue(first.jsJSONParse(`{"theme":"dark","pageSize":25}`))
+
+	second := NewVM(nil, nil, 5)
+	stored := second.applicationValueToValue(storedValue)
+	if stored.Type != VTJSObject {
+		t.Fatalf("expected stored JScript object, got %#v", stored)
+	}
+	if got, _ := second.jsMemberGet(stored, "theme"); got.Type != VTString || got.Str != "dark" {
+		t.Fatalf("stored JScript object did not survive VM boundary: %#v", got)
+	}
+}
+
+func TestJScriptCommentTemplateFunctionToString(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`var source = (function() {/*<h4>{0}</h4>*/}).toString();` +
+		`var match = /function\s*\(.*\)\s*\{\/\*([\s\S]+)\*\/\}/g.exec(source);` +
+		`Response.Write(match ? match[1] : "missing");` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "<h4>{0}</h4>" {
+		t.Fatalf("unexpected comment-template source: %q", out)
+	}
+}
+
+func TestJScriptNestedCallbackThrowPreservesCallerLocals(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`function deep2() { var missing; return missing.value; }` +
+		`function deep1() { return deep2(); }` +
+		`function executeSafely(callback, options) {` +
+		` var resource = { value: "ready" }; var config = options || {};` +
+		` try { callback(resource); } catch (e) { return typeof config + ":" + typeof config.error + ":" + e.message; }` +
+		`}` +
+		`Response.Write(executeSafely(function(resource) { return deep1(); }));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "object:undefined:Cannot read property 'value' of undefined" {
+		t.Fatalf("nested callback throw corrupted caller locals: %q", out)
+	}
+}
+
+func TestJScriptNestedCallbackReturnPreservesCallerLocals(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`function executeSafely(callback, options) {` +
+		` var resource = { value: "ready" }; var config = options || {};` +
+		` try { callback(resource); } catch (e) { return "caught"; }` +
+		` return typeof config + ":" + typeof config.error;` +
+		`}` +
+		`Response.Write(executeSafely(function(resource) { return resource.value; }));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "object:undefined" {
+		t.Fatalf("nested callback return corrupted caller locals: %q", out)
+	}
+}
+
+func TestJScriptNativeCallbackErrorPreservesCallerCatchLocals(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`function executeSafely(options) {` +
+		` var resource = { value: "ready" }; var config = options || {};` +
+		` try { [1].forEach(function() { var missing; return missing.value; }); }` +
+		` catch (e) { return typeof config + ":" + typeof config.error + ":" + typeof resource; }` +
+		`}` +
+		`Response.Write(executeSafely());` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "object:undefined:object" {
+		t.Fatalf("native callback error corrupted caller catch locals: %q", out)
+	}
+}
+
+func TestJScriptNativeDispatchErrorPreservesCallerCatchLocals(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`function executeSafely(callback, options) {` +
+		` var resource = { value: "ready" }; var config = options || {};` +
+		` try { callback(resource); }` +
+		` catch (e) { return typeof config + ":" + typeof config.error + ":" + typeof resource + ":" + e.message; }` +
+		`}` +
+		`Response.Write(executeSafely(function() { Server.CreateObject("Invalid.ProgID"); }));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "object:undefined:object:Invalid class string" {
+		t.Fatalf("native dispatch error corrupted caller catch locals: %q", out)
+	}
+}
+
+func TestJScriptStringReplaceCoercesReplacementObject(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`var value = {value:"replacement", toString:function(){return this.value;}};` +
+		`Response.Write("Result: {token}".replace(new RegExp("\\{token\\}", "g"), value));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "Result: replacement" {
+		t.Fatalf("replacement object was not coerced with ToPrimitive: %q", out)
+	}
+}
+
+func TestJScriptRepeatedClosureCallbackUpdatesOuterLocal(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`function invoke(fn) { fn("updated"); }` +
+		`function getValue() { var value = ""; invoke(function(v) { value = v; }); return value; }` +
+		`Response.Write(getValue() + "|" + getValue());` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "updated|updated" {
+		t.Fatalf("repeated closure callback lost outer assignment: %q", out)
+	}
+}
+
+func TestJScriptRepeatedFunctionCallDoesNotCapturePriorActivation(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`function each(value, fn) { fn(value); }` +
+		`function choose(preferred) { var found = false; each("match", function(v) { if (v == preferred) found = true; }); return found ? preferred : "fallback"; }` +
+		`Response.Write(choose("match") + "|" + choose(""));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "match|fallback" {
+		t.Fatalf("closure captured a prior function activation: %q", out)
+	}
+}
+
+func TestJScriptEnvironmentCaptureCountTracksNestedFunctions(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`function invoke(fn) { fn("captured"); }` +
+		`function choose() { var found = ""; invoke(function(v) { found = v; }); return found; }` +
+		`Response.Write(choose());` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "captured" {
+		t.Fatalf("captured environment lookup failed: %q", out)
+	}
+}
+
+func TestJScriptEscapedClosureKeepsItsActivation(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`function make(value) { return function() { return value; }; }` +
+		`var one = make("one"), two = make("two");` +
+		`Response.Write(one() + "|" + two());` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "one|two" {
+		t.Fatalf("escaped closure lost its activation: %q", out)
+	}
+}
+
+func TestJScriptObjectMethodsKeepSeparateFactoryActivations(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`function factory() { var value = ""; return { set:function(v){value=v;}, get:function(){return value;} }; }` +
+		`var one=factory(), two=factory(); one.set("one"); two.set("two");` +
+		`Response.Write(one.get()+"|"+two.get());` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "one|two" {
+		t.Fatalf("object methods shared factory activation: %q", out)
+	}
+}
+
+func TestJScriptRepeatedNestedMethodReturnsArray(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`function factory() { return { list:function(){return [{item:"sample"}];}, first:function(){var values=this.list(); return values.length ? values[0].item : null;} }; }` +
+		`function once(){var source=factory(); return source.first();}` +
+		`Response.Write(String(once())+"|"+String(once())+"|"+String(once()));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "sample|sample|sample" {
+		t.Fatalf("repeated nested method return lost value: %q", out)
+	}
+}
+
+func TestJScriptNestedCallbackAssignsUndeclaredGlobal(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`function invoke(fn){fn();}` +
+		`function load(){invoke(function(){result={value:"sample"};}); return result.value;}` +
+		`Response.Write(load()+"|"+load());` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "sample|sample" {
+		t.Fatalf("nested callback did not assign undeclared global: %q", out)
+	}
+}
+
 func TestJScriptCompoundAssignmentOperators(t *testing.T) {
 	source := `<script runat="server" language="JScript">` +
 		`var a = 10;` +
@@ -1787,8 +2100,8 @@ func BenchmarkJScriptTailCallDeepRecursion(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		vm := NewVM(compiler.Bytecode(), compiler.Constants(), compiler.GlobalsCount())
 		host := NewMockHost()
 		var output bytes.Buffer
@@ -2200,5 +2513,110 @@ func TestJScriptErrorMSProperties(t *testing.T) {
 				t.Errorf("got %q, want %q", out, tt.expected)
 			}
 		})
+	}
+}
+
+func TestJScriptStringMatchToPrimitiveCoercion(t *testing.T) {
+	source := `<%@ Language="JScript" CodePage="65001" %>` +
+		`<%` +
+		`var ts = "Hello World";` +
+		`var m = ts.match(/World/);` +
+		`Response.Write("m: " + m + "|");` +
+		`Response.Write("str: " + String(m) + "|");` +
+		`Response.Write("empty: " + ("" + m));` +
+		`%>`
+	out := runASPSourceForTest(t, source)
+	expected := "m: World|str: World|empty: World"
+	if out != expected {
+		t.Fatalf("expected match ToPrimitive conversion output %q, got %q", expected, out)
+	}
+}
+
+func TestJScriptEscapeFunctionIsolation(t *testing.T) {
+	jsSource := `<%@ Language="JScript" CodePage="65001" %>` +
+		`<%` +
+		`Response.Write(escape(" ") + "|");` +
+		`Response.Write(escape("こんにちは") + "|");` +
+		`Response.Write(unescape("%20"));` +
+		`%>`
+	jsOut := runASPSourceForTest(t, jsSource)
+	jsExpected := "%20|%u3053%u3093%u306B%u3061%u306F| "
+	if jsOut != jsExpected {
+		t.Fatalf("expected JScript escape output %q, got %q", jsExpected, jsOut)
+	}
+
+	vbsSource := `<%@ Language="VBScript" %>` +
+		`<%` +
+		`Response.Write Escape(" ")` +
+		`%>`
+	vbsOut := runASPSourceForTest(t, vbsSource)
+	vbsExpected := "+"
+	if vbsOut != vbsExpected {
+		t.Fatalf("expected VBScript Escape output %q, got %q", vbsExpected, vbsOut)
+	}
+}
+
+func TestJScriptStringPrototypeHTMLWrappers(t *testing.T) {
+	jsSource := `<%@ Language="JScript" CodePage="65001" %>` +
+		`<%` +
+		`Response.Write("test".anchor("main") + "|");` +
+		`Response.Write("test".big() + "|");` +
+		`Response.Write("test".blink() + "|");` +
+		`Response.Write("test".bold() + "|");` +
+		`Response.Write("test".fixed() + "|");` +
+		`Response.Write("test".fontcolor("red") + "|");` +
+		`Response.Write("test".fontsize(7) + "|");` +
+		`Response.Write("test".italics() + "|");` +
+		`Response.Write("test".link("http://localhost") + "|");` +
+		`Response.Write("test".small() + "|");` +
+		`Response.Write("test".strike() + "|");` +
+		`Response.Write("test".sub() + "|");` +
+		`Response.Write("test".sup() + "|");` +
+		`Response.Write(String.prototype.bold.call("hello"));` +
+		`%>`
+	jsOut := runASPSourceForTest(t, jsSource)
+	jsExpected := `<A NAME="main">test</A>|<BIG>test</BIG>|<BLINK>test</BLINK>|<B>test</B>|<TT>test</TT>|<FONT COLOR="red">test</FONT>|<FONT SIZE="7">test</FONT>|<I>test</I>|<A HREF="http://localhost">test</A>|<SMALL>test</SMALL>|<STRIKE>test</STRIKE>|<SUB>test</SUB>|<SUP>test</SUP>|<B>hello</B>`
+	if jsOut != jsExpected {
+		t.Fatalf("expected JScript String HTML wrappers output %q, got %q", jsExpected, jsOut)
+	}
+}
+
+func TestJScriptStringMethodsParity(t *testing.T) {
+	jsSource := `<%@ Language="JScript" CodePage="65001" %>` +
+		`<%` +
+		`Response.Write(String.fromCharCode(72, 101, 108, 108, 111) + "|");` +
+		`Response.Write("canal".lastIndexOf("a") + "|");` +
+		`Response.Write("canal".lastIndexOf("a", 2) + "|");` +
+		`Response.Write("alphabet".toLocaleUpperCase() + "|");` +
+		`Response.Write("ALPHABET".toLocaleLowerCase());` +
+		`%>`
+	jsOut := runASPSourceForTest(t, jsSource)
+	jsExpected := "Hello|3|1|ALPHABET|alphabet"
+	if jsOut != jsExpected {
+		t.Fatalf("expected JScript String methods parity output %q, got %q", jsExpected, jsOut)
+	}
+}
+
+func TestJScriptFunctionsASPPageParity(t *testing.T) {
+	jsSource := `<%@ Language="JScript" CodePage="65001" %>` +
+		`<%` +
+		`Response.Write(("HW".anchor("top").indexOf("<A") >= 0) + "|");` +
+		`Response.Write(("hi".big().indexOf("<BIG>") >= 0) + "|");` +
+		`Response.Write(("hi".blink().indexOf("<BLINK>") >= 0) + "|");` +
+		`Response.Write(("hi".bold().indexOf("<B>") >= 0) + "|");` +
+		`Response.Write(("hi".fixed().indexOf("<TT>") >= 0) + "|");` +
+		`Response.Write(("hi".fontcolor("red").toLowerCase().indexOf("red") >= 0) + "|");` +
+		`Response.Write(("hi".fontsize(5).indexOf("5") >= 0) + "|");` +
+		`Response.Write(("hi".italics().indexOf("<I>") >= 0) + "|");` +
+		`Response.Write(("HW".link("http://x").toLowerCase().indexOf("href") >= 0) + "|");` +
+		`Response.Write(("hi".small().indexOf("<SMALL>") >= 0) + "|");` +
+		`Response.Write(("hi".strike().indexOf("<STRIKE>") >= 0) + "|");` +
+		`Response.Write(("hi".sub().indexOf("<SUB>") >= 0) + "|");` +
+		`Response.Write(("hi".sup().indexOf("<SUP>") >= 0));` +
+		`%>`
+	jsOut := runASPSourceForTest(t, jsSource)
+	jsExpected := "true|true|true|true|true|true|true|true|true|true|true|true|True"
+	if jsOut != jsExpected {
+		t.Fatalf("expected test_js_functions.asp assertions output %q, got %q", jsExpected, jsOut)
 	}
 }

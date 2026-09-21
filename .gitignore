@@ -11,6 +11,7 @@ build/
 *.wasm
 xcaddy.exe
 caddy.exe
+caddy-linux-amd64
 
 # Code coverage profiles and other test artifacts
 *.out
@@ -20,6 +21,9 @@ profile.cov
 
 #Ignore pandoc
 pandoc.exe
+
+#Ignore internal tests
+G3PIX-WEBSITE/
 
 # Git and IDE
 .vscode/
@@ -78,3 +82,6 @@ www/G3PIX-WEBSITE/
 # AxonHTA test apps - exclude runtime data
 /axonhta/HTAtest/*/temp/
 /axonhta/HTAtest/*/data/state.dat
+/compat_test
+/temp_compat_test
+/temp_mvc_test

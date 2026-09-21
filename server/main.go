@@ -47,10 +47,10 @@ import (
 	"syscall"
 	"time"
 
-	_ "g3pix.com.br/axonasp/axonboot"
-	"g3pix.com.br/axonasp/axonconfig"
-	"g3pix.com.br/axonasp/axonvm"
-	"g3pix.com.br/axonasp/axonvm/asp"
+	_ "g3pix.com.br/axonasp/v2/axonboot"
+	"g3pix.com.br/axonasp/v2/axonconfig"
+	"g3pix.com.br/axonasp/v2/axonvm"
+	"g3pix.com.br/axonasp/v2/axonvm/asp"
 	"github.com/fsnotify/fsnotify"
 	"github.com/joho/godotenv"
 	"github.com/spf13/pflag"
@@ -76,6 +76,7 @@ var (
 	ScriptTimeout                 = 60 // in seconds
 	ResponseBufferLimitBytes      = 4 * 1024 * 1024
 	DebugASP                      = false
+	AllowExternalFilesystemAccess = false
 	CleanupSessions               = true
 	CleanupCache                  = true
 	DefaultTimezone               = "UTC"
@@ -154,6 +155,7 @@ func loadServerConfig() {
 		axonvm.SetInternalErrorLogRootPath(workingDir)
 	}
 	DebugASP = v.GetBool("global.enable_asp_debugging")
+	AllowExternalFilesystemAccess = v.GetBool("server.allow_external_filesystem_access")
 	axonvm.SetInternalErrorLogEnabled(v.GetBool("global.enable_error_log_file"))
 	axonvm.SetDumpPreprocessedSourceEnabled(v.GetBool("global.dump_preprocessed_source"))
 
@@ -411,7 +413,11 @@ func main() {
 		// Execute Application_OnStart using a dummy host
 		req, _ := http.NewRequest("GET", "http://localhost/", nil)
 		dummyHost := NewWebHost(&dummyResponseWriter{}, req)
-		_ = axonvm.GetGlobalASA().ExecuteApplicationOnStart(dummyHost)
+		dummyHost.server.SetRequestPath("/global.asa")
+		if err := axonvm.GetGlobalASA().ExecuteApplicationOnStart(dummyHost); err != nil {
+			axonvm.ReportInternalError(axonvm.HTTPInternalServerError, err, "Application_OnStart failed.", "global.asa", 0)
+			os.Exit(1)
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -804,7 +810,6 @@ func executeASPWithStatus(w http.ResponseWriter, r *http.Request, filePath strin
 	type vmResult struct{ err error }
 	done := make(chan vmResult, 1)
 	go func() {
-		defer vm.Release()
 		runErr := func() (err error) {
 			defer func() {
 				if recovered := recover(); recovered != nil {
@@ -813,6 +818,10 @@ func executeASPWithStatus(w http.ResponseWriter, r *http.Request, filePath strin
 			}()
 			return vm.Run()
 		}()
+		// Return the VM to its program pool before notifying the handler. This
+		// guarantees the next sequential request can reuse the warm VM instead
+		// of racing the deferred release and allocating a second full runtime.
+		vm.Release()
 		done <- vmResult{err: runErr}
 	}()
 

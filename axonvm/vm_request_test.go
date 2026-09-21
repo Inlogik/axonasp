@@ -20,7 +20,10 @@
  */
 package axonvm
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 // TestVMRequestCollections verifies Request collection dispatch paths.
 func TestVMRequestCollections(t *testing.T) {
@@ -54,8 +57,43 @@ func TestVMRequestDefaultCall(t *testing.T) {
 	vm.SetHost(host)
 
 	result := vm.dispatchNativeCall(1, "", []Value{NewString("k")})
-	if result.Type != VTString || result.Str != "value" {
+	if result.Type != VTNativeObject || vm.valueToString(result) != "value" {
 		t.Fatalf("unexpected default Request lookup result: %#v", result)
+	}
+}
+
+func TestVMRequestDefaultCallPreservesEmptyFormValue(t *testing.T) {
+	vm := NewVM(nil, nil, 5)
+	host := NewMockHost()
+	host.Request().Form.Add("optional_field", "")
+	host.Request().Cookies.AddCookie("optional_field", "cookie-fallback")
+	vm.SetHost(host)
+
+	result := vm.dispatchNativeCall(1, "", []Value{NewString("optional_field")})
+	if result.Type != VTNativeObject {
+		t.Fatalf("expected request collection value, got %#v", result)
+	}
+	if got := vm.valueToString(result); got != "" {
+		t.Fatalf("expected present empty form value, got %q", got)
+	}
+	if count := vm.dispatchMemberGet(result, "Count"); count.Type != VTInteger || count.Num != 1 {
+		t.Fatalf("unexpected request value Count: %#v", count)
+	}
+}
+
+func TestVMRequestDefaultCallMissingValuePreservesCollectionSemantics(t *testing.T) {
+	vm := NewVM(nil, nil, 5)
+	vm.SetHost(NewMockHost())
+
+	result := vm.dispatchNativeCall(nativeObjectRequest, "", []Value{NewString("missing")})
+	if result.Type != VTNativeObject {
+		t.Fatalf("expected missing Request value wrapper, got %#v", result)
+	}
+	if got := vm.jsToString(result); got != "" {
+		t.Fatalf("expected empty string conversion, got %q", got)
+	}
+	if got := vm.jsToNumber(result); got.Type != VTDouble || !math.IsNaN(got.Flt) {
+		t.Fatalf("expected missing Request value to convert to NaN, got %#v", got)
 	}
 }
 

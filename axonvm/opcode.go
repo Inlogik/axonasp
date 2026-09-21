@@ -547,6 +547,7 @@ const (
 	ExtOpJSMathSqrt
 	ExtOpJSMathMin
 	ExtOpJSMathMax
+	ExtOpJSMathPow
 
 	// Phase 4: Events
 	// ExtOpRegisterClassEvent registers one event name for a class.
@@ -608,6 +609,10 @@ const (
 	// Stack after:  [..., left >> right]
 	// [OpExtPrefix, ExtOpShiftRight] (0 operand bytes beyond ext opcode)
 	ExtOpShiftRight
+
+	// ExtOpJSWrite writes one stack value using Microsoft JScript
+	// Response.Write coercion without generic member dispatch.
+	ExtOpJSWrite
 )
 
 func (op OpCode) String() string {
@@ -1115,6 +1120,8 @@ func (op ExtOpCode) String() string {
 		return "ExtOpJSMathMin"
 	case ExtOpJSMathMax:
 		return "ExtOpJSMathMax"
+	case ExtOpJSMathPow:
+		return "ExtOpJSMathPow"
 	case ExtOpRegisterClassEvent:
 		return "ExtOpRegisterClassEvent"
 	case ExtOpRaiseEvent:
@@ -1165,6 +1172,8 @@ func (op ExtOpCode) String() string {
 		return "ExtOpShiftLeft"
 	case ExtOpShiftRight:
 		return "ExtOpShiftRight"
+	case ExtOpJSWrite:
+		return "ExtOpJSWrite"
 	default:
 		return "ExtOpUnknown"
 	}

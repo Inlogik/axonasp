@@ -3,10 +3,10 @@ package parser
 import (
 	"strings"
 
-	"g3pix.com.br/axonasp/jscript/ast"
-	"g3pix.com.br/axonasp/jscript/file"
-	"g3pix.com.br/axonasp/jscript/token"
-	"g3pix.com.br/axonasp/jscript/unistring"
+	"g3pix.com.br/axonasp/v2/jscript/ast"
+	"g3pix.com.br/axonasp/v2/jscript/file"
+	"g3pix.com.br/axonasp/v2/jscript/token"
+	"g3pix.com.br/axonasp/v2/jscript/unistring"
 )
 
 func (self *_parser) parseIdentifier() *ast.Identifier {
@@ -374,10 +374,8 @@ func (self *_parser) parseObjectPropertyKey() (string, unistring.String, ast.Exp
 		}
 	case token.PRIVATE_IDENTIFIER:
 		value = &ast.PrivateIdentifier{
-			Identifier: ast.Identifier{
-				Idx:  idx,
-				Name: parsedLiteral,
-			},
+			Idx:  idx,
+			Name: parsedLiteral,
 		}
 	default:
 		// null, false, class, etc.
@@ -970,10 +968,8 @@ func (self *_parser) parseShiftExpression() ast.Expression {
 func (self *_parser) parseRelationalExpression() ast.Expression {
 	if self.scope.allowIn && self.token == token.PRIVATE_IDENTIFIER {
 		left := &ast.PrivateIdentifier{
-			Identifier: ast.Identifier{
-				Idx:  self.idx,
-				Name: self.parsedLiteral,
-			},
+			Idx:  self.idx,
+			Name: self.parsedLiteral,
 		}
 		self.next()
 		if self.token == token.IN {

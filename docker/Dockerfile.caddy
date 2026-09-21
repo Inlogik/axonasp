@@ -22,7 +22,7 @@
 #
 
 # ─── Stage 1: Builder ────────────────────────────────────────────────────────
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
@@ -51,8 +51,8 @@ RUN if [ -z "$VERSION" ]; then \
     cd caddy && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     xcaddy build \
-    --with g3pix.com.br/axonasp/caddy=. \
-    --replace "g3pix.com.br/axonasp=/build" \
+    --with g3pix.com.br/axonasp/v2/caddy=. \
+    --replace "g3pix.com.br/axonasp/v2=/build" \
     --replace "github.com/google/cel-go=github.com/google/cel-go@v0.20.1" && \
     ls -la caddy
 

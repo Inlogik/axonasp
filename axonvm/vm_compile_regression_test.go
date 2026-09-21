@@ -31,8 +31,8 @@ import (
 	"strings"
 	"testing"
 
-	"g3pix.com.br/axonasp/axonvm/asp"
-	"g3pix.com.br/axonasp/vbscript"
+	"g3pix.com.br/axonasp/v2/axonvm/asp"
+	"g3pix.com.br/axonasp/v2/vbscript"
 )
 
 // TestASPCompileSupportsBooleanLiteralArguments verifies boolean literals compile in statement-style member calls.
@@ -1423,6 +1423,65 @@ Response.Write "Name=" & rs.Fields.Item("Nome")
 	}
 }
 
+// TestJScriptExpressionBlockNullCoercion verifies SQL NULLs are rendered with
+// JScript semantics so generic null-handling helpers can recognize them.
+func TestJScriptExpressionBlockNullCoercion(t *testing.T) {
+	source := `<%@ language="JavaScript" %><% var value = null; %><%= value %>`
+	compiler := NewASPCompiler(source)
+	if err := compiler.Compile(); err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	vm := NewVM(compiler.Bytecode(), compiler.Constants(), compiler.GlobalsCount())
+	host := NewMockHost()
+	var output bytes.Buffer
+	host.SetOutput(&output)
+	vm.SetHost(host)
+	if err := vm.Run(); err != nil {
+		t.Fatalf("vm run failed: %v", err)
+	}
+	host.Response().Flush()
+	if output.String() != "null" {
+		t.Fatalf("expected JScript null output, got %q", output.String())
+	}
+}
+
+func TestJScriptStringCoercesNullADODBFieldToLowercaseNull(t *testing.T) {
+	vm := NewVM(nil, nil, 0)
+	rs := &adodbRecordset{
+		state:              adStateOpen,
+		currentRow:         0,
+		columns:            []string{"optional_text"},
+		data:               []map[string]Value{{"optional_text": NewNull()}},
+		columnTypeByName:   map[string]int{"optional_text": 200},
+		columnSizeByName:   map[string]int{},
+		columnAttrByName:   map[string]int{},
+		columnScaleByName:  map[string]int{},
+		fieldChunkOffset:   map[string]int{},
+		columnIndexByLower: map[string]int{"optional_text": 0},
+	}
+	field := vm.newADODBFieldProxy(rs, "optional_text")
+	if got := vm.jsToString(field); got != "null" {
+		t.Fatalf("expected lowercase JScript null, got %q", got)
+	}
+}
+
+func TestJScriptUnaryPlusCoercesADODBFieldValue(t *testing.T) {
+	vm := NewVM(nil, nil, 0)
+	rsVal := vm.newADODBRecordset()
+	rs := vm.adodbRecordsetItems[rsVal.Num]
+	rs.columns = []string{"count"}
+	rs.data = []map[string]Value{{"count": NewInteger(5)}}
+	rs.recordCount = 1
+	rs.currentRow = 0
+	rs.state = adStateOpen
+	field := vm.newADODBFieldProxy(rs, "count")
+
+	got := vm.jsToNumber(field)
+	if got.Type != VTDouble || got.Flt != 5 {
+		t.Fatalf("unexpected ADODB numeric coercion: %#v", got)
+	}
+}
+
 // TestASPNativeObjectArgumentPassThrough verifies native objects passed as Sub
 // arguments are not coerced through __default__ before call dispatch.
 func TestASPNativeObjectArgumentPassThrough(t *testing.T) {
@@ -2137,7 +2196,7 @@ Function convertBool(value)
 
 Function cId()
 	cId = 1
-	End Function
+End Function
 
 Dim logon
 Set logon = New cls_LogonEdit
@@ -2669,8 +2728,7 @@ End Class
 		t.Fatalf("expected compile error for property signature mismatch")
 	}
 
-	var syntaxErr *vbscript.VBSyntaxError
-	if !errors.As(err, &syntaxErr) {
+	if _, ok := errors.AsType[*vbscript.VBSyntaxError](err); !ok {
 		t.Fatalf("expected VBSyntaxError, got %T", err)
 	}
 }
@@ -2690,8 +2748,7 @@ End Class
 		t.Fatalf("expected compile error for Property Let without value parameter")
 	}
 
-	var syntaxErr *vbscript.VBSyntaxError
-	if !errors.As(err, &syntaxErr) {
+	if _, ok := errors.AsType[*vbscript.VBSyntaxError](err); !ok {
 		t.Fatalf("expected VBSyntaxError, got %T", err)
 	}
 }
@@ -4741,15 +4798,13 @@ Response.Write "ok"
 }
 
 // TestASPCommentIgnoresPercentCodeEndMarker verifies %> inside apostrophe comments
-// does not terminate the current ASP code block.
+// closes the current ASP block and trailing text on the line is parsed as HTML text.
 func TestASPCommentIgnoresPercentCodeEndMarker(t *testing.T) {
 	source := `<%
 Dim test1
 test1 = "before"
-' This is a comment with %> in the middle and more text after
-test1 = test1 & " after"
 Response.Write test1
-%>`
+' This is a comment with %> in the middle and more text after`
 
 	compiler := NewASPCompiler(source)
 	if err := compiler.Compile(); err != nil {
@@ -4767,21 +4822,21 @@ Response.Write test1
 	}
 	host.Response().Flush()
 
-	if output.String() != "before after" {
-		t.Fatalf("expected output before after, got %q", output.String())
+	expected := "before in the middle and more text after"
+	if output.String() != expected {
+		t.Fatalf("expected output %q, got %q", expected, output.String())
 	}
 }
 
-// TestASPCommentIgnoresMultiplePercentCodeEndMarkers verifies multiple %> sequences
-// inside a comment remain comment text until end of line.
+// TestASPCommentIgnoresMultiplePercentCodeEndMarkers verifies %> inside apostrophe comments
+// terminates the ASP block, and trailing markers transition between HTML and ASP blocks.
 func TestASPCommentIgnoresMultiplePercentCodeEndMarkers(t *testing.T) {
 	source := `<%
-Dim test2
+Dim test2, var1
 test2 = "start"
-' Comment with multiple markers: %> text <%=var%> more text %>
-test2 = test2 & " end"
+var1 = "middle"
 Response.Write test2
-%>`
+' Comment with multiple markers: %> text <%=var1%> more text %>`
 
 	compiler := NewASPCompiler(source)
 	if err := compiler.Compile(); err != nil {
@@ -4799,8 +4854,41 @@ Response.Write test2
 	}
 	host.Response().Flush()
 
-	if output.String() != "start end" {
-		t.Fatalf("expected output start end, got %q", output.String())
+	expected := "start text middle more text %>"
+	if output.String() != expected {
+		t.Fatalf("expected output %q, got %q", expected, output.String())
+	}
+}
+
+// TestASPCommentBlockTerminationReproduction verifies that %> inside a VBScript comment
+// (even when starting the line) correctly closes the ASP block, reproducing IIS Classic ASP output.
+func TestASPCommentBlockTerminationReproduction(t *testing.T) {
+	source := `<%
+Dim total
+total = 42
+' a note that ends the block on the same line %>
+<p>Total: <%= total %></p>
+`
+
+	compiler := NewASPCompiler(source)
+	if err := compiler.Compile(); err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+
+	vm := NewVM(compiler.Bytecode(), compiler.Constants(), compiler.GlobalsCount())
+	host := NewMockHost()
+	var output bytes.Buffer
+	host.SetOutput(&output)
+	vm.SetHost(host)
+
+	if err := vm.Run(); err != nil {
+		t.Fatalf("vm run failed: %v", err)
+	}
+	host.Response().Flush()
+
+	expected := "<p>Total: 42</p>\n"
+	if output.String() != expected {
+		t.Fatalf("expected output %q, got %q", expected, output.String())
 	}
 }
 

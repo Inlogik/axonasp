@@ -9,8 +9,8 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/version-2.3-blue.svg" alt="Version 2.3"/>
-  <img src="https://img.shields.io/badge/Go-1.26+-00ADD8.svg" alt="Go Version"/>
-  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg" alt="Platform"/>
+  <img src="https://img.shields.io/badge/Go-1.27+-00ADD8.svg" alt="Go Version"/>
+  <img src="https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20FreeBSD-lightgrey.svg" alt="Platforms"/>
   <img src="https://img.shields.io/badge/license-MPL-green.svg" alt="License"/>
 </p>
 
@@ -55,12 +55,75 @@ You can use the **AxonLive Builder** available in the `www/axonlive/builder/` di
 
 ## 🚀 Quick Deployment & Execution
 
-AxonASP is ready for modern CI/CD pipelines and containerization.
+AxonASP is ready for modern CI/CD pipelines and containerization. Official multi-architecture Docker images (`linux/amd64`, `linux/arm64`) are published to GitHub Container Registry (`ghcr.io`).
 
-### Prerequisites
-* GoLang 1.26+ (if building from source)
+### Docker Deployment
 
-### Building the Engine
+AxonASP provides two official Docker container variants:
+
+#### 1. Standalone AxonASP Server Container
+Runs the native AxonASP HTTP engine (`axonasp-http`), FastCGI server (`axonasp-fastcgi`), and MCP server (`axonasp-mcp`).
+
+* **Image:** `ghcr.io/guimaraeslucas/axonasp:latest` (or versioned tag `:v2.3.0`)
+* **Default Ports:** `8801` (HTTP), `9000` (FastCGI), `8000` (MCP)
+
+```bash
+# Pull the standalone image
+docker pull ghcr.io/guimaraeslucas/axonasp:latest
+
+# Run standalone server with web root mounted
+docker run -d \
+  --name axonasp \
+  -p 8801:8801 \
+  -v $(pwd)/www:/opt/axonasp/www \
+  --restart unless-stopped \
+  ghcr.io/guimaraeslucas/axonasp:latest
+```
+
+#### 2. Caddy Server Container (AxonASP Caddy Edition)
+Bundles the Caddy Web Server with the native AxonASP Go module compiled directly in. Provides zero-process ASP execution, automatic TLS (HTTPS), and native Caddyfile routing. Avoid all the complexity of reverse proxying, FPM and TLS certificate management.
+
+* **Image:** `ghcr.io/guimaraeslucas/axonasp:caddy` (or versioned tag `:caddy-v2.3.0`)
+* **Default Port:** `8801` (or `80`/`443` with custom Caddyfile)
+
+```bash
+# Pull the Caddy edition image
+docker pull ghcr.io/guimaraeslucas/axonasp:caddy
+
+# Run Caddy server with web root mounted
+docker run -d \
+  --name axonasp-caddy \
+  -p 8801:8801 \
+  -v $(pwd)/www:/opt/axonasp/www \
+  --restart unless-stopped \
+  ghcr.io/guimaraeslucas/axonasp:caddy
+```
+
+You can also supply a custom `Caddyfile`:
+
+```bash
+docker run -d \
+  --name axonasp-caddy \
+  -p 80:80 \
+  -p 443:443 \
+  -v $(pwd)/www:/opt/axonasp/www \
+  -v $(pwd)/Caddyfile:/opt/axonasp/Caddyfile \
+  --restart unless-stopped \
+  ghcr.io/guimaraeslucas/axonasp:caddy
+```
+
+### Local Development with Docker Compose
+
+Run the local development stack with hot-reloading:
+
+```bash
+docker compose up -d
+```
+
+### Building from Source
+
+Prerequisites: GoLang 1.26+ (if building from source)
+
 Use the provided build scripts to compile AxonASP for your target architecture:
 
 **Linux / macOS:**
@@ -76,7 +139,7 @@ Use the provided build scripts to compile AxonASP for your target architecture:
 You can optionally disable specific libraries (e.g., `lib_g3crypto_disabled`) to create leaner binaries. See the manual for details.
 
 ### Deployment Architecture
-Deploy AxonASP via its built-in HTTP server (Reverse Proxy Mode) or via FastCGI (`axonasp-fastcgi`). It integrates flawlessly with Nginx and Apache allowing you to serve Classic ASP applications in modern web environments. You can use the experimental Caddy module to run AxonASP directly inside Caddy server for a fully integrated experience without need for FastCGI.
+Deploy AxonASP via its built-in HTTP server (Reverse Proxy Mode), via FastCGI (`axonasp-fastcgi`), or integrated natively inside Caddy Server (`ghcr.io/guimaraeslucas/axonasp:caddy`). It integrates flawlessly with Nginx, Apache, and Caddy allowing you to serve Classic ASP applications in modern web environments.
 
 See our full documentation in `www/manual/md/` for examples and complete API details.
 
@@ -86,11 +149,11 @@ Nightly releases are made available thanks to [@jeffreyheping](https://github.co
 
 ## License 📝
 
-This project is licensed under the MPL 2.0 License - see the [LICENSE.txt](LICENSE.txt) file for details.
+This project is licensed under the MPL 2.0 License - see the [LICENSE.txt](LICENSE.txt) file for details. If you use this software in other projects, let us know, as it is good to improve the visibility of AxonASP in the community.
 
 ## Contributing to AxonASP 🤝
 
-While not mandatory, we warmly encourage you to contribute to the AxonASP project. If you develop new components or libraries, please consider sharing your implementation with the community; your contributions help maintain, improve, and expand our ecosystem.
+While not mandatory, we warmly encourage you to contribute to the AxonASP project. If you develop new components or libraries, *please consider sharing* your implementation with the community; your contributions help maintain, improve, and expand our ecosystem.
 
 If you find bugs, security vulnerabilities, or have suggestions for new features, **please report them** via GitHub Issues. We welcome your feedback and will do our best to address your concerns promptly.
 
@@ -112,6 +175,11 @@ Thanks goes to these wonderful people:
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/dmitriy-bty"><img src="https://avatars.githubusercontent.com/u/285232216?v=4?s=100" width="100px;" alt="dmitriy-bty"/><br /><sub><b>dmitriy-bty</b></sub></a><br /><a href="https://github.com/guimaraeslucas/axonasp/commits?author=dmitriy-bty" title="Code">💻</a> <a href="https://github.com/guimaraeslucas/axonasp/issues?q=author%3Admitriy-bty" title="Bug reports">🐛</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/jeffreyheping"><img src="https://avatars.githubusercontent.com/u/100673826?v=4?s=100" width="100px;" alt="Jeffrey He"/><br /><sub><b>Jeffrey He</b></sub></a><br /><a href="https://github.com/guimaraeslucas/axonasp/issues?q=author%3Ajeffreyheping" title="Bug reports">🐛</a> <a href="https://github.com/guimaraeslucas/axonasp/commits?author=jeffreyheping" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/mlaadd"><img src="https://avatars.githubusercontent.com/u/61882328?v=4?s=100" width="100px;" alt="mlaadd"/><br /><sub><b>mlaadd</b></sub></a><br /><a href="https://github.com/guimaraeslucas/axonasp/issues?q=author%3Amlaadd" title="Bug reports">🐛</a> <a href="https://github.com/guimaraeslucas/axonasp/commits?author=mlaadd" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/zydronium"><img src="https://avatars.githubusercontent.com/u/1164978?v=4?s=100" width="100px;" alt="Jelle Luteijn"/><br /><sub><b>Jelle Luteijn</b></sub></a><br /><a href="https://github.com/guimaraeslucas/axonasp/issues?q=author%3Azydronium" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/saborrie"><img src="https://avatars.githubusercontent.com/u/4096734?v=4?s=100" width="100px;" alt="Steven Borrie"/><br /><sub><b>Steven Borrie</b></sub></a><br /><a href="https://github.com/guimaraeslucas/axonasp/issues?q=author%3Asaborrie" title="Bug reports">🐛</a> <a href="https://github.com/guimaraeslucas/axonasp/commits?author=saborrie" title="Code">💻</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/schotime"><img src="https://avatars.githubusercontent.com/u/202923?v=4?s=100" width="100px;" alt="Adam Schroder"/><br /><sub><b>Adam Schroder</b></sub></a><br /><a href="https://github.com/guimaraeslucas/axonasp/issues?q=author%3Aschotime" title="Bug reports">🐛</a> <a href="https://github.com/guimaraeslucas/axonasp/commits?author=schotime" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>

@@ -33,9 +33,10 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"g3pix.com.br/axonasp/jscript"
-	jsast "g3pix.com.br/axonasp/jscript/ast"
-	"g3pix.com.br/axonasp/vbscript"
+	"g3pix.com.br/axonasp/v2/jscript"
+	jsast "g3pix.com.br/axonasp/v2/jscript/ast"
+	jsfile "g3pix.com.br/axonasp/v2/jscript/file"
+	"g3pix.com.br/axonasp/v2/vbscript"
 )
 
 // dumpPreprocessedSourceEnabled controls whether compiled source is written to ./temp/ for debugging.
@@ -263,6 +264,7 @@ type Compiler struct {
 	jsLocalSlotCount      int               // Number of local slots allocated for current function
 	jsInGeneratorFunction bool              // True when compiling a generator body.
 	jsCompileLineAnchors  []jscriptCompileLineAnchor
+	jsCurrentFile         *jsfile.File
 	jsNextICNodeID        uint32 // Next available inline cache node ID for JScript AST nodes
 	jsICNodeCount         uint32 // Total inline cache nodes assigned across the program
 	// withDepth tracks nesting level of With...End With blocks at compile time.
@@ -1861,29 +1863,90 @@ func (c *Compiler) skipTopLevelDefinitionBlock(endKeyword vbscript.Keyword) {
 	}
 }
 
-// prebindTopLevelDimDeclarations scans source-level Dim declarations before
-// definition prebinding so local procedure compilation can still resolve true
-// globals declared outside procedures.
+// isArrayAssignmentAhead checks whether the tokens following an identifier like name( ... ) are followed by '='
+func (c *Compiler) isArrayAssignmentAhead() bool {
+	if c == nil || c.lexer == nil {
+		return false
+	}
+	lexerCopy := *c.lexer
+	depth := 0
+	for {
+		tok := lexerCopy.NextToken()
+		if tok == nil {
+			return false
+		}
+		if _, ok := tok.(*vbscript.EOFToken); ok {
+			return false
+		}
+		if p, ok := tok.(*vbscript.PunctuationToken); ok {
+			switch p.Type {
+			case vbscript.PunctLParen:
+				depth++
+			case vbscript.PunctRParen:
+				depth--
+				if depth == 0 {
+					nextTok := lexerCopy.NextToken()
+					if np, ok := nextTok.(*vbscript.PunctuationToken); ok && np.Type == vbscript.PunctEqual {
+						return true
+					}
+					return false
+				}
+			}
+		}
+		switch tok.(type) {
+		case *vbscript.LineTerminationToken, *vbscript.ColonLineTerminationToken, *vbscript.ASPCodeEndToken:
+			return false
+		}
+	}
+}
+
+// prebindTopLevelDimDeclarations scans source-level Dim declarations and implicitly
+// created page-scope variables before definition prebinding so local procedure compilation
+// can resolve both explicit and implicit page-scope variables.
 func (c *Compiler) prebindTopLevelDimDeclarations() {
 	if c == nil {
 		return
 	}
 
+	atStmtStart := true
 	for !c.matchEof() {
 		if c.matchEof() {
 			return
 		}
 
+		if c.checkKeyword(vbscript.KeywordOption) {
+			c.move()
+			if c.checkKeyword(vbscript.KeywordExplicit) {
+				c.optionExplicit = true
+				c.move()
+			}
+			atStmtStart = false
+			continue
+		}
+
 		if c.checkKeyword(vbscript.KeywordClass) {
 			c.skipTopLevelDefinitionBlock(vbscript.KeywordClass)
+			atStmtStart = true
 			continue
 		}
 		if c.checkKeyword(vbscript.KeywordSub) {
 			c.skipTopLevelDefinitionBlock(vbscript.KeywordSub)
+			atStmtStart = true
 			continue
 		}
 		if c.checkKeyword(vbscript.KeywordFunction) {
 			c.skipTopLevelDefinitionBlock(vbscript.KeywordFunction)
+			atStmtStart = true
+			continue
+		}
+		if c.checkKeyword(vbscript.KeywordProperty) {
+			c.skipTopLevelDefinitionBlock(vbscript.KeywordProperty)
+			atStmtStart = true
+			continue
+		}
+		if c.checkKeyword(vbscript.KeywordEnum) {
+			c.skipTopLevelDefinitionBlock(vbscript.KeywordEnum)
+			atStmtStart = true
 			continue
 		}
 
@@ -1891,18 +1954,43 @@ func (c *Compiler) prebindTopLevelDimDeclarations() {
 			scopeTok := c.move()
 			if c.checkKeyword(vbscript.KeywordClass) {
 				c.skipTopLevelDefinitionBlock(vbscript.KeywordClass)
+				atStmtStart = true
 				continue
 			}
 			if c.checkKeyword(vbscript.KeywordSub) {
 				c.skipTopLevelDefinitionBlock(vbscript.KeywordSub)
+				atStmtStart = true
 				continue
 			}
 			if c.checkKeyword(vbscript.KeywordFunction) {
 				c.skipTopLevelDefinitionBlock(vbscript.KeywordFunction)
+				atStmtStart = true
 				continue
 			}
-			if !c.checkKeyword(vbscript.KeywordDim) {
+			if c.checkKeyword(vbscript.KeywordProperty) {
+				c.skipTopLevelDefinitionBlock(vbscript.KeywordProperty)
+				atStmtStart = true
+				continue
+			}
+			if c.checkKeyword(vbscript.KeywordDim) {
+				c.move()
+				// Dim handling continues below
+			} else {
+				for {
+					name, ok := isIdentifierLikeTokenForPrescan(c.next)
+					if !ok || name == "" {
+						break
+					}
+					c.declareVar(name)
+					c.move()
+					if p, ok := c.next.(*vbscript.PunctuationToken); ok && p.Type == vbscript.PunctComma {
+						c.move()
+						continue
+					}
+					break
+				}
 				_ = scopeTok
+				atStmtStart = false
 				continue
 			}
 		}
@@ -1946,9 +2034,120 @@ func (c *Compiler) prebindTopLevelDimDeclarations() {
 			nextDimName:
 			}
 		endDimList:
+			atStmtStart = true
 			continue
 		}
 
+		// Implicit page-scope variable prebinding (only when Option Explicit is off)
+		if !c.optionExplicit {
+			if c.checkKeyword(vbscript.KeywordSet) {
+				c.move()
+				if name, ok := isIdentifierLikeTokenForPrescan(c.next); ok && name != "" {
+					c.move()
+					if p, ok := c.next.(*vbscript.PunctuationToken); ok && p.Type == vbscript.PunctEqual {
+						lower := strings.ToLower(name)
+						if !c.declaredGlobals[lower] && !c.constGlobals[lower] {
+							c.Globals.Add(name)
+							c.implicitGlobals[lower] = true
+						}
+					}
+				}
+				atStmtStart = false
+				continue
+			}
+
+			if c.checkKeyword(vbscript.KeywordFor) {
+				c.move()
+				if c.tokenMatchesKeywordOrIdentifier(c.next, vbscript.KeywordEach, "each") {
+					c.move()
+					if name, ok := isIdentifierLikeTokenForPrescan(c.next); ok && name != "" {
+						lower := strings.ToLower(name)
+						if !c.declaredGlobals[lower] && !c.constGlobals[lower] {
+							c.Globals.Add(name)
+							c.implicitGlobals[lower] = true
+						}
+					}
+				} else {
+					if name, ok := isIdentifierLikeTokenForPrescan(c.next); ok && name != "" {
+						c.move()
+						if p, ok := c.next.(*vbscript.PunctuationToken); ok && p.Type == vbscript.PunctEqual {
+							lower := strings.ToLower(name)
+							if !c.declaredGlobals[lower] && !c.constGlobals[lower] {
+								c.Globals.Add(name)
+								c.implicitGlobals[lower] = true
+							}
+						}
+					}
+				}
+				atStmtStart = false
+				continue
+			}
+
+			if c.checkKeyword(vbscript.KeywordReDim) {
+				c.move()
+				if c.tokenMatchesKeywordOrIdentifier(c.next, vbscript.KeywordPreserve, "preserve") {
+					c.move()
+				}
+				if name, ok := isIdentifierLikeTokenForPrescan(c.next); ok && name != "" {
+					lower := strings.ToLower(name)
+					if !c.declaredGlobals[lower] && !c.constGlobals[lower] {
+						c.Globals.Add(name)
+						c.implicitGlobals[lower] = true
+					}
+				}
+				atStmtStart = false
+				continue
+			}
+
+			if atStmtStart {
+				if name, ok := isIdentifierLikeTokenForPrescan(c.next); ok && name != "" {
+					peek := c.peekToken()
+					if p, ok := peek.(*vbscript.PunctuationToken); ok && p.Type == vbscript.PunctEqual {
+						lower := strings.ToLower(name)
+						if !c.declaredGlobals[lower] && !c.constGlobals[lower] {
+							c.Globals.Add(name)
+							c.implicitGlobals[lower] = true
+						}
+						c.move() // consume identifier
+						c.move() // consume '='
+						atStmtStart = false
+						continue
+					} else if p, ok := peek.(*vbscript.PunctuationToken); ok && p.Type == vbscript.PunctLParen {
+						if c.isArrayAssignmentAhead() {
+							lower := strings.ToLower(name)
+							if !c.declaredGlobals[lower] && !c.constGlobals[lower] {
+								c.Globals.Add(name)
+								c.implicitGlobals[lower] = true
+							}
+							c.move()
+							atStmtStart = false
+							continue
+						}
+					}
+				}
+			}
+		}
+
+		switch t := c.next.(type) {
+		case *vbscript.LineTerminationToken, *vbscript.ColonLineTerminationToken, *vbscript.ASPCodeEndToken, *vbscript.ASPCodeStartToken:
+			atStmtStart = true
+		case *vbscript.KeywordToken:
+			if t.Keyword == vbscript.KeywordThen || t.Keyword == vbscript.KeywordElse {
+				atStmtStart = true
+			} else {
+				atStmtStart = false
+			}
+		case *vbscript.KeywordOrIdentifierToken:
+			if strings.EqualFold(t.Name, "then") || strings.EqualFold(t.Name, "else") {
+				atStmtStart = true
+			} else {
+				atStmtStart = false
+			}
+		case *vbscript.CommentToken:
+			// keep current atStmtStart
+		default:
+			atStmtStart = false
+		}
 		c.move()
 	}
 }
@@ -2482,8 +2681,7 @@ func (c *Compiler) normalizeCompileError(err error) error {
 		return nil
 	}
 
-	var jsSyntaxErr *jscript.JSSyntaxError
-	if errors.As(err, &jsSyntaxErr) {
+	if jsSyntaxErr, ok := errors.AsType[*jscript.JSSyntaxError](err); ok {
 		mapped := false
 		if c != nil && jsSyntaxErr != nil {
 			if file, line, ok := c.mapMergedSourceLine(jsSyntaxErr.Line); ok {
@@ -2503,8 +2701,7 @@ func (c *Compiler) normalizeCompileError(err error) error {
 		return jsSyntaxErr
 	}
 
-	var syntaxErr *vbscript.VBSyntaxError
-	if errors.As(err, &syntaxErr) {
+	if syntaxErr, ok := errors.AsType[*vbscript.VBSyntaxError](err); ok {
 		if syntaxErr != nil && strings.TrimSpace(syntaxErr.File) != "" {
 			return syntaxErr
 		}

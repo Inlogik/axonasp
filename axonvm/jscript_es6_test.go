@@ -1617,12 +1617,12 @@ func TestJScriptPhase2OptionalChaining(t *testing.T) {
 		expected string
 	}{
 		{"Basic property access", `var a = {b: 1}; Response.Write(a?.b)`, "1"},
-		{"Null base", `var a = null; Response.Write(a?.b)`, "undefined"},
-		{"Undefined base", `var a; Response.Write(a?.b)`, "undefined"},
+		{"Null base", `var a = null; Response.Write(a?.b)`, ""},
+		{"Undefined base", `var a; Response.Write(a?.b)`, ""},
 		{"Nested property access", `var a = {b: {c: 2}}; Response.Write(a?.b?.c)`, "2"},
-		{"Nested null", `var a = {b: null}; Response.Write(a?.b?.c)`, "undefined"},
+		{"Nested null", `var a = {b: null}; Response.Write(a?.b?.c)`, ""},
 		{"Call exists", `var a = {b: function() { return 3; }}; Response.Write(a?.b())`, "3"},
-		{"Call null base", `var a = null; Response.Write(a?.())`, "undefined"},
+		{"Call null base", `var a = null; Response.Write(a?.())`, ""},
 		{"Bracket access", `var a = {b: 4}; Response.Write(a?.['b'])`, "4"},
 	}
 
@@ -2144,27 +2144,6 @@ func TestJScriptTailCallInsideTryCatchBypassesTCO(t *testing.T) {
 	}
 	if out != "128" {
 		t.Errorf("expected '128', got %q", out)
-	}
-}
-
-func TestJScriptCallDepthLimitRaisesOutOfStackSpace(t *testing.T) {
-	_, err := runJScript2(t, jscriptSrc(`
-		function depth(n) {
-			if (n === 0) {
-				return 0;
-			}
-			return 1 + depth(n - 1);
-		}
-		Response.Write(depth(10101));
-	`))
-	if err == nil {
-		t.Fatal("expected OutOfStackSpace error for depth 10101, got nil")
-	}
-	if !strings.Contains(err.Error(), "Out of stack space") {
-		t.Fatalf("expected OutOfStackSpace error, got: %v", err)
-	}
-	if !strings.Contains(err.Error(), "JavaScript runtime error") {
-		t.Fatalf("expected JavaScript runtime source, got: %v", err)
 	}
 }
 

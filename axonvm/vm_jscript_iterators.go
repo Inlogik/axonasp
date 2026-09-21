@@ -162,6 +162,9 @@ func (vm *VM) jsPopulatePrototypes(bindings map[string]Value) {
 	// Array.prototype[Symbol.iterator] = Array.prototype.values
 	if arrayCtor, ok := bindings["Array"]; ok {
 		if proto, deferred := vm.jsMemberGet(arrayCtor, "prototype"); !deferred && proto.Type == VTJSObject {
+			for _, name := range []string{"slice", "forEach", "map", "filter", "at", "findLast", "toSorted", "with", "toReversed", "toSpliced", "flat", "flatMap"} {
+				vm.jsSetDescriptor(proto.Num, name, jsBuiltinMethodDescriptor(vm.jsCreateNativeFunction(name, "ArrayPrototypeMethod")))
+			}
 			// Array.prototype.toString overwrites Object.prototype.toString
 			toStringFn := vm.jsCreateNativeFunction("toString", "ArrayPrototypeToString")
 			vm.jsSetDescriptor(proto.Num, "toString", jsBuiltinMethodDescriptor(toStringFn))
@@ -206,6 +209,7 @@ func (vm *VM) jsPopulatePrototypes(bindings map[string]Value) {
 
 	// String.prototype[Symbol.iterator]
 	if stringCtor, ok := bindings["String"]; ok {
+		vm.jsSetDescriptor(stringCtor.Num, "fromCharCode", jsBuiltinMethodDescriptor(vm.jsCreateNativeFunction("fromCharCode", "StringFromCharCode")))
 		if proto, deferred := vm.jsMemberGet(stringCtor, "prototype"); !deferred && proto.Type == VTJSObject {
 			itKey := jsSymbolPropertyPrefix + strconv.FormatInt(jsWellKnownSymbolIterator, 10)
 			itFn := vm.jsCreateNativeFunction("[Symbol.iterator]", "StringIteratorFactory")
@@ -217,6 +221,12 @@ func (vm *VM) jsPopulatePrototypes(bindings map[string]Value) {
 				Writable:     true,
 			})
 			vm.jsSetDescriptor(proto.Num, "matchAll", jsBuiltinMethodDescriptor(vm.jsCreateNativeFunction("matchAll", "StringPrototypeMatchAll")))
+			for _, name := range []string{"anchor", "big", "blink", "bold", "fixed", "fontcolor", "fontsize", "italics", "link", "small", "strike", "sub", "sup"} {
+				vm.jsSetDescriptor(proto.Num, name, jsBuiltinMethodDescriptor(vm.jsCreateNativeFunction(name, "StringPrototypeHTMLWrapper")))
+			}
+			for _, name := range []string{"lastIndexOf", "toLocaleLowerCase", "toLocaleUpperCase"} {
+				vm.jsSetDescriptor(proto.Num, name, jsBuiltinMethodDescriptor(vm.jsCreateNativeFunction(name, "StringPrototypeMethod")))
+			}
 		}
 	}
 
