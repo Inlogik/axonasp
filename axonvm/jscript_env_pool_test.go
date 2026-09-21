@@ -4,7 +4,10 @@ import "testing"
 
 func TestJScriptReleasedEnvironmentBindingsAreReusedCleared(t *testing.T) {
 	vm := NewVM(nil, nil, 0)
-	envID := vm.allocJSID()
+	envID := vm.allocJSEnvID()
+	if _, exists := vm.jsObjectKeyOrder[envID]; exists {
+		t.Fatal("environment ID allocated object key-order state")
+	}
 	bindings := map[string]Value{"stale": NewString("value")}
 	vm.jsEnvItems[envID] = &jsEnvFrame{bindings: bindings}
 
@@ -27,7 +30,7 @@ func TestJScriptReleasedEnvironmentBindingsAreReusedCleared(t *testing.T) {
 
 func TestJScriptCapturedEnvironmentBindingsAreNotReused(t *testing.T) {
 	vm := NewVM(nil, nil, 0)
-	envID := vm.allocJSID()
+	envID := vm.allocJSEnvID()
 	vm.jsEnvItems[envID] = &jsEnvFrame{
 		bindings:         map[string]Value{"captured": NewString("value")},
 		capturedClosures: 1,

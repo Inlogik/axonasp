@@ -318,7 +318,7 @@ func (vm *VM) jsImportModule(specifier string) (*jsEnvFrame, bool) {
 	vm.ensureJSRootEnv()
 	rootEnvID := vm.jsActiveEnvID
 
-	moduleEnvID := vm.allocJSID()
+	moduleEnvID := vm.allocJSEnvID()
 	moduleEnv := &jsEnvFrame{parentID: rootEnvID, bindings: make(map[string]Value, 16)}
 	vm.jsEnvItems[moduleEnvID] = moduleEnv
 	vm.jsModuleInstances[modulePath] = moduleEnv
@@ -2452,6 +2452,15 @@ func (vm *VM) allocJSID() int64 {
 	return id
 }
 
+// allocJSEnvID reserves an ID for a lexical environment without allocating
+// object-property tracking state. Environment IDs share the dynamic ID space
+// with objects but are never exposed as JavaScript values.
+func (vm *VM) allocJSEnvID() int64 {
+	id := vm.nextDynamicNativeID
+	vm.nextDynamicNativeID++
+	return id
+}
+
 func (vm *VM) jsAllocSymbolID() int64 {
 	id := vm.jsNextSymbolID
 	vm.jsNextSymbolID++
@@ -3633,7 +3642,7 @@ func (vm *VM) jsBeginFunctionCall(fn Value, thisVal Value, args []Value, ctorObj
 	vm.jsBlockScopeConst = append(make([]map[string]struct{}, 0, len(closure.capturedBlockScopeConst)), closure.capturedBlockScopeConst...)
 	vm.jsBlockScopeTDZ = append(make([]map[string]struct{}, 0, len(closure.capturedBlockScopeTDZ)), closure.capturedBlockScopeTDZ...)
 	vm.jsBlockScopeDepth = len(vm.jsBlockScopes)
-	envID := vm.allocJSID()
+	envID := vm.allocJSEnvID()
 	bindings := vm.jsAcquireEnvBindings(len(closure.params) + 2)
 	for i := 0; i < len(closure.params); i++ {
 		if i < len(args) {
@@ -3932,7 +3941,7 @@ func (vm *VM) jsTailCallValue(callee Value, thisVal Value, args []Value) bool {
 	}
 	if !canReuseEnv {
 		vm.jsReleaseEnvFrame(vm.jsActiveEnvID)
-		envID = vm.allocJSID()
+		envID = vm.allocJSEnvID()
 		bindings = vm.jsAcquireEnvBindings(len(closure.params) + 2)
 		vm.jsEnvItems[envID] = &jsEnvFrame{parentID: closure.envID, bindings: bindings}
 	}

@@ -5769,7 +5769,7 @@ aspExecLoop:
 			vm.ip += 2
 			vm.ensureJSRootEnv()
 			parentID := vm.jsActiveEnvID
-			childID := vm.allocJSID()
+			childID := vm.allocJSEnvID()
 			bindings := make(map[string]Value, numVars+2)
 			for range numVars {
 				nameIdx := binary.BigEndian.Uint16(vm.bytecode[vm.ip:])
