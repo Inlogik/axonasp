@@ -92,8 +92,35 @@ func TestVMRequestDefaultCallMissingValuePreservesCollectionSemantics(t *testing
 	if got := vm.jsToString(result); got != "" {
 		t.Fatalf("expected empty string conversion, got %q", got)
 	}
+	if value := vm.requestCollectionValueItems[result.Num]; !value.MissingAsEmpty {
+		t.Fatal("expected default Request lookup to mark a missing value as empty")
+	}
 	if got := vm.jsToNumber(result); got.Type != VTDouble || !math.IsNaN(got.Flt) {
 		t.Fatalf("expected missing Request value to convert to NaN, got %#v", got)
+	}
+}
+
+func TestJScriptMissingRequestStringRemainsEmptyAcrossFunctionReturn(t *testing.T) {
+	host := NewMockHost()
+	source := `<%@ Language="JScript" %><%
+function initialize() {
+    var optionalValue = String(Request("optional_value"));
+    Response.Write(typeof optionalValue + "|" + optionalValue + "|" + Server.URLEncode(optionalValue));
+}
+initialize();
+%>`
+
+	if got := runASPSourceForTestWithHost(t, source, host); got != "string||" {
+		t.Fatalf("unexpected missing Request value after function return: %q", got)
+	}
+}
+
+func TestJScriptMissingRequestStringIsEmptyAtTopLevel(t *testing.T) {
+	host := NewMockHost()
+	source := `<%@ Language="JScript" %><% Response.Write("[" + String(Request("optional_value")) + "]"); %>`
+
+	if got := runASPSourceForTestWithHost(t, source, host); got != "[]" {
+		t.Fatalf("unexpected top-level missing Request value: %q", got)
 	}
 }
 

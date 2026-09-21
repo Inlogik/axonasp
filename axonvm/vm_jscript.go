@@ -10878,6 +10878,11 @@ func (vm *VM) jsToString(v Value) string {
 		return "undefined"
 	case VTNull:
 		return "null"
+	case VTDate:
+		if result, handled := vm.jsCallDateMethod(v, "toString", nil); handled {
+			return result.Str
+		}
+		return vm.valueToString(v)
 	case VTBool:
 		if v.Num != 0 {
 			return "true"

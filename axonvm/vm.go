@@ -6739,7 +6739,7 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 				// Request("missing") is still an IIS Request collection value.
 				// Preserve that distinction so string coercion yields "" while
 				// numeric JScript coercion yields NaN rather than zero.
-				return vm.newRequestCollectionValueItem(asp.RequestCollectionValue{})
+				return vm.newRequestCollectionValueItem(asp.RequestCollectionValue{MissingAsEmpty: true})
 			}
 			return emptyForCtx()
 		case strings.EqualFold(member, "QueryString"):
@@ -6993,17 +6993,17 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		switch {
 		case strings.EqualFold(member, "HTMLEncode"):
 			if len(args) >= 1 {
-				return NewString(server.HTMLEncode(args[0].String()))
+				return NewString(server.HTMLEncode(vm.valueToString(args[0])))
 			}
 			return NewString("")
 		case strings.EqualFold(member, "URLEncode"):
 			if len(args) >= 1 {
-				return NewString(server.URLEncode(args[0].String()))
+				return NewString(server.URLEncode(vm.valueToString(args[0])))
 			}
 			return NewString("")
 		case strings.EqualFold(member, "URLPathEncode"):
 			if len(args) >= 1 {
-				return NewString(server.URLPathEncode(args[0].String()))
+				return NewString(server.URLPathEncode(vm.valueToString(args[0])))
 			}
 			return NewString("")
 		case strings.EqualFold(member, "MapPath"):

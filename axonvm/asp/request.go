@@ -42,6 +42,9 @@ type requestKVPair struct {
 type RequestCollectionValue struct {
 	Values     []string
 	Attributes map[string]string
+	// MissingAsEmpty preserves the IIS Request("missing") default-member
+	// coercion. Explicit collection lookups retain JScript undefined semantics.
+	MissingAsEmpty bool
 }
 
 // NewRequestCollectionValue creates a collection value from one or many values.
