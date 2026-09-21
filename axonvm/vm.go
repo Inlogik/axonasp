@@ -423,6 +423,9 @@ type VM struct {
 	adodbFieldItems                map[int64]*adodbFieldProxy
 	regExpItems                    map[int64]*regExpNativeObject
 	jsRegExpItems                  map[int64]*jsRegExpObject
+	// Immutable compiled programs are retained across pooled VM resets. RegExp
+	// instance state (including lastIndex) remains in the request-local object.
+	jsRegExpProgramCache           map[jsRegExpCacheKey]jsRegExpCacheEntry
 	regExpMatchesCollectionItems   map[int64]*regExpMatchesCollection
 	regExpMatchItems               map[int64]*regExpMatch
 	regExpSubMatchesItems          map[int64]*regExpSubMatches
@@ -435,10 +438,10 @@ type VM struct {
 	jsObjectKeyOrder               map[int64][]string
 	jsObjectKeySet                 map[int64]map[string]struct{}
 	jsObjectSlots                  map[int64][]Value
-	jsObjectSlotIndex              map[int64]map[string]uint16
 	jsObjectShape                  map[int64]uint32
 	jsShapeSlots                   map[uint32][]string
-	jsShapeBySignature             map[string]uint32
+	jsShapeSlotIndex               map[uint32]map[string]uint16
+	jsShapeTransitions             map[jsShapeTransition]uint32
 	jsNextShapeID                  uint32
 	jsObjectStateItems             map[int64]jsObjectState
 	jsSymbolStateItems             map[int64]jsObjectState
@@ -776,6 +779,7 @@ func NewVM(bytecode []byte, constants []Value, globalCount int) *VM {
 		adodbFieldItems:                make(map[int64]*adodbFieldProxy),
 		regExpItems:                    make(map[int64]*regExpNativeObject),
 		jsRegExpItems:                  make(map[int64]*jsRegExpObject),
+		jsRegExpProgramCache:           make(map[jsRegExpCacheKey]jsRegExpCacheEntry),
 		regExpMatchesCollectionItems:   make(map[int64]*regExpMatchesCollection),
 		regExpMatchItems:               make(map[int64]*regExpMatch),
 		regExpSubMatchesItems:          make(map[int64]*regExpSubMatches),
@@ -788,10 +792,10 @@ func NewVM(bytecode []byte, constants []Value, globalCount int) *VM {
 		jsObjectKeyOrder:               make(map[int64][]string),
 		jsObjectKeySet:                 make(map[int64]map[string]struct{}),
 		jsObjectSlots:                  make(map[int64][]Value),
-		jsObjectSlotIndex:              make(map[int64]map[string]uint16),
 		jsObjectShape:                  make(map[int64]uint32),
 		jsShapeSlots:                   make(map[uint32][]string),
-		jsShapeBySignature:             make(map[string]uint32),
+		jsShapeSlotIndex:               make(map[uint32]map[string]uint16),
+		jsShapeTransitions:             make(map[jsShapeTransition]uint32),
 		jsNextShapeID:                  1,
 		jsObjectStateItems:             make(map[int64]jsObjectState),
 		jsSymbolStateItems:             make(map[int64]jsObjectState),
@@ -4849,9 +4853,7 @@ aspExecLoop:
 			}
 			vm.jsObjectItems[objID] = obj
 			vm.jsObjectSlots[objID] = make([]Value, 0, 8)
-			vm.jsObjectSlotIndex[objID] = make(map[string]uint16, 8)
 			vm.jsObjectShape[objID] = 0
-			vm.jsPropertyItems[objID] = make(map[string]jsPropertyDescriptor, 8)
 			vm.push(Value{Type: VTJSObject, Num: objID})
 
 		case OpJSNewArray:

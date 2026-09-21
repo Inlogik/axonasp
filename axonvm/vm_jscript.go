@@ -110,10 +110,24 @@ type jsArgumentsBinding struct {
 }
 
 type jsRegExpObject struct {
-	pattern   string
-	flags     string
-	compiled  *regexp2.Regexp
-	lastIndex int
+	compiled *regexp2.Regexp
+}
+
+type jsRegExpCacheKey struct {
+	pattern string
+	flags   string
+}
+
+type jsRegExpCacheEntry struct {
+	compiled *regexp2.Regexp
+	err      error
+}
+
+const jsRegExpProgramCacheLimit = 1024
+
+type jsShapeTransition struct {
+	shapeID uint32
+	name    string
 }
 
 type jsDefinePropertySpec struct {
@@ -1253,7 +1267,48 @@ func (vm *VM) jsSetProto(target Value, proto Value) {
 func (vm *VM) jsInvalidateObjectIC(objID int64) {
 	delete(vm.jsObjectShape, objID)
 	delete(vm.jsObjectSlots, objID)
-	delete(vm.jsObjectSlotIndex, objID)
+}
+
+func (vm *VM) jsTransitionObjectShape(objID int64, key string, value Value) bool {
+	oldShape, tracked := vm.jsObjectShape[objID]
+	if !tracked || strings.HasPrefix(key, jsInternalPropPrefix) {
+		return false
+	}
+	if slot, exists := vm.jsShapeSlotIndex[oldShape][key]; exists {
+		slots := vm.jsObjectSlots[objID]
+		if int(slot) < len(slots) {
+			slots[slot] = value
+			return true
+		}
+		vm.jsInvalidateObjectIC(objID)
+		return false
+	}
+
+	transition := jsShapeTransition{shapeID: oldShape, name: key}
+	newShape := vm.jsShapeTransitions[transition]
+	if newShape == 0 {
+		newShape = vm.jsNextShapeID
+		if newShape == 0 {
+			newShape = 1
+		}
+		vm.jsNextShapeID = newShape + 1
+
+		oldNames := vm.jsShapeSlots[oldShape]
+		names := make([]string, len(oldNames)+1)
+		copy(names, oldNames)
+		names[len(oldNames)] = key
+		index := make(map[string]uint16, len(names))
+		for i, name := range names {
+			index[name] = uint16(i)
+		}
+		vm.jsShapeSlots[newShape] = names
+		vm.jsShapeSlotIndex[newShape] = index
+		vm.jsShapeTransitions[transition] = newShape
+	}
+
+	vm.jsObjectShape[objID] = newShape
+	vm.jsObjectSlots[objID] = append(vm.jsObjectSlots[objID], value)
+	return true
 }
 
 func (vm *VM) jsEnsureObjectICLayout(objID int64) bool {
@@ -1261,49 +1316,36 @@ func (vm *VM) jsEnsureObjectICLayout(objID int64) bool {
 	if !ok {
 		return false
 	}
-	keys := make([]string, 0, len(obj))
+	if _, tracked := vm.jsObjectShape[objID]; tracked {
+		return true
+	}
+
+	vm.jsObjectShape[objID] = 0
+	vm.jsObjectSlots[objID] = make([]Value, 0, len(obj))
+	seen := make(map[string]struct{}, len(obj))
+	for _, key := range vm.jsObjectKeyOrder[objID] {
+		value, exists := obj[key]
+		if !exists || strings.HasPrefix(key, jsInternalPropPrefix) {
+			continue
+		}
+		vm.jsTransitionObjectShape(objID, key, value)
+		seen[key] = struct{}{}
+	}
+	fallbackKeys := make([]string, 0, len(obj)-len(seen))
 	for key := range obj {
 		if strings.HasPrefix(key, jsInternalPropPrefix) {
 			continue
 		}
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	var shapeSig strings.Builder
-	for i := 0; i < len(keys); i++ {
-		if i > 0 {
-			shapeSig.WriteByte('\x1f')
+		if _, exists := seen[key]; exists {
+			continue
 		}
-		shapeSig.WriteString(keys[i])
+		fallbackKeys = append(fallbackKeys, key)
 	}
-
-	shapeID := vm.jsShapeBySignature[shapeSig.String()]
-	if shapeID == 0 {
-		shapeID = vm.jsNextShapeID
-		if shapeID == 0 {
-			shapeID = 1
-		}
-		vm.jsNextShapeID = shapeID + 1
-		vm.jsShapeBySignature[shapeSig.String()] = shapeID
-		if len(keys) > 0 {
-			layout := make([]string, len(keys))
-			copy(layout, keys)
-			vm.jsShapeSlots[shapeID] = layout
-		}
+	sort.Strings(fallbackKeys)
+	for _, key := range fallbackKeys {
+		value := obj[key]
+		vm.jsTransitionObjectShape(objID, key, value)
 	}
-
-	slots := make([]Value, len(keys))
-	indexByName := make(map[string]uint16, len(keys))
-	for i := 0; i < len(keys); i++ {
-		k := keys[i]
-		slots[i] = obj[k]
-		indexByName[k] = uint16(i)
-	}
-
-	vm.jsObjectShape[objID] = shapeID
-	vm.jsObjectSlots[objID] = slots
-	vm.jsObjectSlotIndex[objID] = indexByName
 	return true
 }
 
@@ -1318,7 +1360,7 @@ func (vm *VM) jsResolveICSlot(target Value, member string) (uint32, uint16, bool
 	if shapeID == 0 {
 		return 0, 0, false
 	}
-	slot, ok := vm.jsObjectSlotIndex[target.Num][member]
+	slot, ok := vm.jsShapeSlotIndex[shapeID][member]
 	if !ok {
 		return 0, 0, false
 	}
@@ -1383,10 +1425,14 @@ func (vm *VM) jsICMemberSet(target Value, member string, val Value, shapeID uint
 	}
 	slots[slot] = val
 	vm.jsObjectSlots[target.Num] = slots
-	if hasDesc {
+	if props := vm.jsPropertyItems[target.Num]; props != nil {
+		desc, hasExplicitDesc := props[member]
+		if !hasExplicitDesc {
+			return true
+		}
 		desc.Value = val
 		desc.HasValue = true
-		vm.jsPropertyItems[target.Num][member] = desc
+		props[member] = desc
 	}
 	return true
 }
@@ -1543,21 +1589,38 @@ func (vm *VM) jsGetDescriptor(objID int64, key string) (jsPropertyDescriptor, bo
 }
 
 func (vm *VM) jsSetDescriptor(objID int64, key string, desc jsPropertyDescriptor) {
-	props := vm.jsEnsurePropertyMap(objID)
-	_, exists := props[key]
-	props[key] = desc
-	if !exists {
+	obj := vm.jsObjectItems[objID]
+	props := vm.jsPropertyItems[objID]
+	_, descriptorExists := props[key]
+	_, propertyTracked := vm.jsObjectKeySet[objID][key]
+	propertyExists := propertyTracked || descriptorExists
+	defaultData := desc.HasValue && !desc.HasGetter && !desc.HasSetter && desc.Enumerable && desc.Configurable && desc.Writable
+
+	if defaultData {
+		if descriptorExists {
+			delete(props, key)
+		}
+	} else {
+		props = vm.jsEnsurePropertyMap(objID)
+		props[key] = desc
+	}
+	if !propertyExists {
 		vm.jsTrackObjectKey(objID, key)
 	}
 	if desc.HasValue {
-		obj, ok := vm.jsObjectItems[objID]
-		if !ok {
+		if obj == nil {
 			obj = make(map[string]Value, 8)
 			vm.jsObjectItems[objID] = obj
 		}
 		obj[key] = desc.Value
+		if defaultData {
+			vm.jsTransitionObjectShape(objID, key, desc.Value)
+		} else {
+			vm.jsInvalidateObjectIC(objID)
+		}
+	} else {
+		vm.jsInvalidateObjectIC(objID)
 	}
-	vm.jsInvalidateObjectIC(objID)
 }
 
 func (vm *VM) jsCreatePrototypeObject(owner Value) Value {
@@ -8632,7 +8695,7 @@ func (vm *VM) jsStringReplaceRegex(source string, pattern string, flags string, 
 	if !useCallback {
 		replacement = vm.jsToString(replacementArg)
 	}
-	flagsLower := strings.ToLower(flags)
+	flagsLower := jsASCIILowerRegExpFlags(flags)
 	useAll := replaceAll || strings.Contains(flagsLower, "g")
 
 	var b strings.Builder
@@ -11828,6 +11891,7 @@ func (vm *VM) jsMemberDelete(obj Value, member string) bool {
 				delete(props, member)
 			}
 			vm.jsUntrackObjectKey(obj.Num, member)
+			vm.jsInvalidateObjectIC(obj.Num)
 			return true
 		}
 	}
@@ -12056,9 +12120,9 @@ func jsTranslateUnicodePropertyEscapes(pattern string) string {
 }
 
 func (vm *VM) jsCompileRegExp(pattern string, flags string) (*regexp2.Regexp, error) {
+	flagsLower := jsASCIILowerRegExpFlags(flags)
 	var options regexp2.RegexOptions
 
-	flagsLower := strings.ToLower(flags)
 	if strings.Contains(flagsLower, "i") {
 		options |= regexp2.IgnoreCase
 	}
@@ -12070,13 +12134,54 @@ func (vm *VM) jsCompileRegExp(pattern string, flags string) (*regexp2.Regexp, er
 	}
 	if strings.Contains(flagsLower, "u") {
 		options |= regexp2.Unicode
+	}
+	cacheKey := jsRegExpCacheKey{pattern: pattern, flags: jsCanonicalRegExpCacheFlags(flagsLower)}
+	if cached, ok := vm.jsRegExpProgramCache[cacheKey]; ok {
+		return cached.compiled, cached.err
+	}
+	compilePattern := pattern
+	if strings.Contains(flagsLower, "u") {
 		// Translate JS \u{...} to regexp2 \x{...}
-		pattern = jsRegExpUnicodeEscapeRegex.ReplaceAllString(pattern, `\x{$1}`)
+		compilePattern = jsRegExpUnicodeEscapeRegex.ReplaceAllString(compilePattern, `\x{$1}`)
 		// Normalize JS Unicode property aliases to regex category shorthands.
-		pattern = jsTranslateUnicodePropertyEscapes(pattern)
+		compilePattern = jsTranslateUnicodePropertyEscapes(compilePattern)
 	}
 
-	return regexp2.Compile(pattern, options)
+	compiled, err := regexp2.Compile(compilePattern, options)
+	if vm.jsRegExpProgramCache == nil {
+		vm.jsRegExpProgramCache = make(map[jsRegExpCacheKey]jsRegExpCacheEntry)
+	}
+	if len(vm.jsRegExpProgramCache) < jsRegExpProgramCacheLimit {
+		vm.jsRegExpProgramCache[cacheKey] = jsRegExpCacheEntry{compiled: compiled, err: err}
+	}
+	return compiled, err
+}
+
+func jsCanonicalRegExpCacheFlags(flags string) string {
+	var canonical [6]byte
+	count := 0
+	for _, flag := range []byte{'g', 'i', 'm', 's', 'u', 'y'} {
+		if strings.ContainsRune(flags, rune(flag)) {
+			canonical[count] = flag
+			count++
+		}
+	}
+	return string(canonical[:count])
+}
+
+func jsASCIILowerRegExpFlags(flags string) string {
+	for i := 0; i < len(flags); i++ {
+		if flags[i] >= 'A' && flags[i] <= 'Z' {
+			lower := []byte(flags)
+			for j := i; j < len(lower); j++ {
+				if lower[j] >= 'A' && lower[j] <= 'Z' {
+					lower[j] += 'a' - 'A'
+				}
+			}
+			return string(lower)
+		}
+	}
+	return flags
 }
 
 func (vm *VM) jsGetCompiledRegExp(objID int64) (*regexp2.Regexp, error) {
@@ -12093,8 +12198,6 @@ func (vm *VM) jsGetCompiledRegExp(objID int64) (*regexp2.Regexp, error) {
 	}
 
 	vm.jsRegExpItems[objID] = &jsRegExpObject{
-		pattern:  pattern,
-		flags:    flags,
 		compiled: re,
 	}
 	return re, nil
