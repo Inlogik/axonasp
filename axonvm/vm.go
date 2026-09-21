@@ -6587,9 +6587,11 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 			return NewInteger(0)
 		case strings.EqualFold(member, "CodePage"):
 			if len(args) >= 1 {
+				codePage := vm.asInt(args[0])
+				response.SetCodePage(codePage)
 				session := vm.host.Session()
 				if session != nil {
-					session.SetCodePage(vm.asInt(args[0]))
+					session.SetCodePage(codePage)
 				}
 				return Value{Type: VTEmpty}
 			}
@@ -8413,8 +8415,10 @@ func (vm *VM) dispatchMemberSet(objID int64, member string, val Value) {
 				vm.host.Session().SetLCID(vm.asInt(val))
 			}
 		case strings.EqualFold(member, "CodePage"):
+			codePage := vm.asInt(val)
+			vm.host.Response().SetCodePage(codePage)
 			if vm.host != nil && vm.host.Session() != nil {
-				vm.host.Session().SetCodePage(vm.asInt(val))
+				vm.host.Session().SetCodePage(codePage)
 			}
 		}
 		return
