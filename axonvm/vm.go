@@ -574,6 +574,9 @@ type VM struct {
 	sourceMap            SourceMap         // Sparse merged-to-original source line mapping for include-aware errors.
 	dynamicProgramStarts map[uint64]int    // Per-VM start offsets for already-appended cached dynamic fragments.
 	jsStringWorkBytes    int64             // Per-run cumulative bytes produced by JScript string operations.
+	// Decoded immutable metadata keyed by function-template constant index.
+	// Retained across pooled VM resets for the base compiled program.
+	jsFunctionTemplateMetadataCache []*jsFunctionTemplateMetadata
 
 	RecordDecls      []CompiledRecordDecl
 	RecordDeclLookup map[string]int
@@ -4711,7 +4714,7 @@ aspExecLoop:
 		case OpJSCreateClosure:
 			templateIdx := binary.BigEndian.Uint16(vm.bytecode[vm.ip:])
 			vm.ip += 2
-			vm.push(vm.jsCreateClosure(vm.constants[templateIdx]))
+			vm.push(vm.jsCreateClosure(templateIdx))
 
 		case OpJSDefineProperty:
 			nameIdx := binary.BigEndian.Uint16(vm.bytecode[vm.ip:])

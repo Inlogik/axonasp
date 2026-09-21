@@ -286,6 +286,10 @@ func (vm *VM) captureBaseProgramState() {
 	vm.baseSourceMap = vm.sourceMap.Clone()
 	vm.bytecode = immutableBytecodeView(vm.baseBytecode)
 	vm.constants = immutableValueView(vm.baseConstants)
+	if len(vm.jsFunctionTemplateMetadataCache) > len(vm.baseConstants) {
+		clear(vm.jsFunctionTemplateMetadataCache[len(vm.baseConstants):])
+		vm.jsFunctionTemplateMetadataCache = vm.jsFunctionTemplateMetadataCache[:len(vm.baseConstants)]
+	}
 }
 
 func (vm *VM) resetForReuse() {

@@ -155,6 +155,23 @@ type jsFunctionObject struct {
 	hiddenWeakData          map[uint64]Value
 }
 
+// jsFunctionTemplateMetadata is the immutable, decoded form of metadata stored
+// in a VTJSFunctionTemplate constant. It is cached per pooled VM so repeated
+// requests do not reparse integers or base64-decode names and source text.
+type jsFunctionTemplateMetadata struct {
+	params             []string
+	restParam          string
+	source             string
+	localCount         int
+	localNames         []string
+	isClassConstructor bool
+	isStrict           bool
+	isDerived          bool
+	isGenerator        bool
+	isAsync            bool
+	usesArguments      bool
+}
+
 type jsCallFrame struct {
 	returnIP             int
 	envID                int64
@@ -3331,29 +3348,28 @@ func (vm *VM) jsChargeStringWork(size int) bool {
 	return false
 }
 
-func (vm *VM) jsCreateClosure(template Value) Value {
-	if template.Type != VTJSFunctionTemplate && template.Type != VTJSArrowFunctionTemplate {
-		return Value{Type: VTJSUndefined}
+func (vm *VM) jsFunctionTemplateMetadata(templateIdx uint16, template Value) *jsFunctionTemplateMetadata {
+	index := int(templateIdx)
+	if len(vm.jsFunctionTemplateMetadataCache) < len(vm.constants) {
+		vm.jsFunctionTemplateMetadataCache = append(
+			vm.jsFunctionTemplateMetadataCache,
+			make([]*jsFunctionTemplateMetadata, len(vm.constants)-len(vm.jsFunctionTemplateMetadataCache))...,
+		)
 	}
-	id := vm.allocJSID()
-	fnVal := Value{Type: VTJSFunction, Num: id}
-	proto := vm.jsCreatePrototypeObject(fnVal)
-	params := make([]string, 0, len(template.Names))
-	restParam := ""
-	source := ""
-	localCount := 0
-	isClassConstructor := false
-	isStrict := false
-	isDerived := false
-	isGenerator := false
-	isAsync := false
-	usesArguments := false
-	var localNames []string
+	if index < len(vm.jsFunctionTemplateMetadataCache) {
+		if cached := vm.jsFunctionTemplateMetadataCache[index]; cached != nil {
+			return cached
+		}
+	}
+
+	metadata := &jsFunctionTemplateMetadata{
+		params: make([]string, 0, len(template.Names)),
+	}
 	for i := 0; i < len(template.Names); i++ {
 		name := template.Names[i]
 		if after, ok := strings.CutPrefix(name, "__js_local_count__:"); ok {
 			if n, err := strconv.Atoi(after); err == nil && n > 0 {
-				localCount = n
+				metadata.localCount = n
 			}
 			continue
 		}
@@ -3363,67 +3379,76 @@ func (vm *VM) jsCreateClosure(template Value) Value {
 				slot, slotErr := strconv.Atoi(parts[0])
 				decoded, decodeErr := base64.StdEncoding.DecodeString(parts[1])
 				if slotErr == nil && decodeErr == nil && slot >= 0 {
-					if len(localNames) <= slot {
-						localNames = append(localNames, make([]string, slot-len(localNames)+1)...)
+					if len(metadata.localNames) <= slot {
+						metadata.localNames = append(metadata.localNames, make([]string, slot-len(metadata.localNames)+1)...)
 					}
-					localNames[slot] = string(decoded)
+					metadata.localNames[slot] = string(decoded)
 				}
 			}
 			continue
 		}
 		if after, ok := strings.CutPrefix(name, jsRestParamPrefix); ok {
-			restParam = after
+			metadata.restParam = after
 			continue
 		}
 		if after, ok := strings.CutPrefix(name, jsFunctionSourceMetaPrefix); ok {
 			if decoded, err := base64.StdEncoding.DecodeString(after); err == nil {
-				source = string(decoded)
+				metadata.source = string(decoded)
 			}
 			continue
 		}
-		if name == jsClassConstructorFlag {
-			isClassConstructor = true
-			continue
+		switch name {
+		case jsClassConstructorFlag:
+			metadata.isClassConstructor = true
+		case jsStrictModeFlag:
+			metadata.isStrict = true
+		case jsGeneratorFlag:
+			metadata.isGenerator = true
+		case jsAsyncFlag:
+			metadata.isAsync = true
+		case jsDerivedConstructorFlag:
+			metadata.isDerived = true
+		case jsUsesArgumentsFlag:
+			metadata.usesArguments = true
+		default:
+			metadata.params = append(metadata.params, name)
 		}
-		if name == jsStrictModeFlag {
-			isStrict = true
-			continue
-		}
-		if name == jsGeneratorFlag {
-			isGenerator = true
-			continue
-		}
-		if name == jsAsyncFlag {
-			isAsync = true
-			continue
-		}
-		if name == jsDerivedConstructorFlag {
-			isDerived = true
-			continue
-		}
-		if name == jsUsesArgumentsFlag {
-			usesArguments = true
-			continue
-		}
-		params = append(params, name)
 	}
+	if index < len(vm.jsFunctionTemplateMetadataCache) {
+		vm.jsFunctionTemplateMetadataCache[index] = metadata
+	}
+	return metadata
+}
+
+func (vm *VM) jsCreateClosure(templateIdx uint16) Value {
+	if int(templateIdx) >= len(vm.constants) {
+		return Value{Type: VTJSUndefined}
+	}
+	template := vm.constants[templateIdx]
+	if template.Type != VTJSFunctionTemplate && template.Type != VTJSArrowFunctionTemplate {
+		return Value{Type: VTJSUndefined}
+	}
+	id := vm.allocJSID()
+	fnVal := Value{Type: VTJSFunction, Num: id}
+	proto := vm.jsCreatePrototypeObject(fnVal)
+	metadata := vm.jsFunctionTemplateMetadata(templateIdx, template)
 	fnObj := &jsFunctionObject{
 		name:               template.Str,
-		source:             source,
-		params:             params,
-		restParam:          restParam,
-		localCount:         localCount,
-		localNames:         localNames,
+		source:             metadata.source,
+		params:             metadata.params,
+		restParam:          metadata.restParam,
+		localCount:         metadata.localCount,
+		localNames:         metadata.localNames,
 		startIP:            int(template.Num),
 		endIP:              int(template.Flt),
 		envID:              vm.jsActiveEnvID,
 		protoID:            proto.Num,
-		isClassConstructor: isClassConstructor,
-		isStrict:           isStrict,
-		isDerived:          isDerived,
-		isAsync:            isAsync,
-		isGenerator:        isGenerator,
-		usesArguments:      usesArguments,
+		isClassConstructor: metadata.isClassConstructor,
+		isStrict:           metadata.isStrict,
+		isDerived:          metadata.isDerived,
+		isAsync:            metadata.isAsync,
+		isGenerator:        metadata.isGenerator,
+		usesArguments:      metadata.usesArguments,
 	}
 	if vm.jsBlockScopeDepth > 0 {
 		activeDepth := min(min(min(vm.jsBlockScopeDepth, len(vm.jsBlockScopes)), len(vm.jsBlockScopeConst)), len(vm.jsBlockScopeTDZ))

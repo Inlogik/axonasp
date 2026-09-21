@@ -225,6 +225,103 @@ func TestJScriptResponseWriteFromScriptTag(t *testing.T) {
 	}
 }
 
+func TestJScriptFunctionTemplateMetadataIsReused(t *testing.T) {
+	source := `<%@ Language="JScript" %><%
+function sample(first, second) {
+    var localValue = first + second;
+    return localValue;
+}
+Response.Write(sample("a", "b"));
+%>`
+	compiler := NewASPCompiler(source)
+	if err := compiler.Compile(); err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	vm := NewVMFromCompiler(compiler)
+
+	templateIndex := -1
+	for index, constant := range vm.constants {
+		if constant.Type == VTJSFunctionTemplate && constant.Str == "sample" {
+			templateIndex = index
+			break
+		}
+	}
+	if templateIndex < 0 {
+		t.Fatal("sample function template was not found")
+	}
+
+	template := vm.constants[templateIndex]
+	first := vm.jsFunctionTemplateMetadata(uint16(templateIndex), template)
+	second := vm.jsFunctionTemplateMetadata(uint16(templateIndex), template)
+	if first != second {
+		t.Fatal("function template metadata was decoded more than once")
+	}
+	if len(first.params) != 2 || first.params[0] != "first" || first.params[1] != "second" {
+		t.Fatalf("unexpected decoded parameters: %#v", first.params)
+	}
+	if first.localCount < 3 {
+		t.Fatalf("unexpected local count: %d", first.localCount)
+	}
+	if len(first.localNames) < 3 || first.localNames[2] != "localValue" {
+		t.Fatalf("unexpected decoded local names: %#v", first.localNames)
+	}
+
+	host := NewMockHost()
+	var output bytes.Buffer
+	host.SetOutput(&output)
+	host.Response().SetBuffer(false)
+	vm.SetHost(host)
+	if err := vm.Run(); err != nil {
+		t.Fatalf("vm run failed: %v", err)
+	}
+	if output.String() != "ab" {
+		t.Fatalf("unexpected function output: got %q want %q", output.String(), "ab")
+	}
+}
+
+func TestJScriptFunctionTemplateMetadataSurvivesPooledReset(t *testing.T) {
+	source := `<%@ Language="JScript" %><% function value() { return "ok"; } Response.Write(value()); %>`
+	compiler := NewASPCompiler(source)
+	if err := compiler.Compile(); err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	program := buildCachedProgramFromCompiler(compiler)
+	vm := AcquireVMFromCachedProgram(program)
+
+	var output bytes.Buffer
+	host := NewMockHost()
+	host.SetOutput(&output)
+	host.Response().SetBuffer(false)
+	vm.SetHost(host)
+	if err := vm.Run(); err != nil {
+		t.Fatalf("first run failed: %v", err)
+	}
+	var cached *jsFunctionTemplateMetadata
+	for _, metadata := range vm.jsFunctionTemplateMetadataCache {
+		if metadata != nil {
+			cached = metadata
+			break
+		}
+	}
+	if cached == nil {
+		t.Fatal("function template metadata was not cached")
+	}
+	vm.Release()
+
+	vm = AcquireVMFromCachedProgram(program)
+	defer vm.Release()
+	foundSame := false
+	for _, metadata := range vm.jsFunctionTemplateMetadataCache {
+		if metadata == cached {
+			foundSame = true
+			break
+		}
+	}
+	if !foundSame {
+		t.Fatal("pooled reset discarded immutable function template metadata")
+	}
+}
+
 func TestJScriptForLoopBytecodeContainsUpdateOpcodes(t *testing.T) {
 	source := `<script runat="server" language="JScript">for (var i = 0; i < 2; i++) { var x = 0; x += i; }</script>`
 	compiler := NewASPCompiler(source)
