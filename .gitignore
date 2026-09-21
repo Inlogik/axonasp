@@ -67,6 +67,7 @@ axonvm/temp
 axonvm/www
 wasm/axonasp.wasm
 mcp/search-index/
+www/G3PIX-WEBSITE/
 
 #G3Search
 *.seg
