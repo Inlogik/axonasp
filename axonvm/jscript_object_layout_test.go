@@ -32,7 +32,7 @@ func TestJScriptObjectShapeTransitionsAreShared(t *testing.T) {
 	}
 }
 
-func TestJScriptObjectShapeTransitionsResetWithRequestObjects(t *testing.T) {
+func TestJScriptObjectShapeTransitionsSurvivePooledReset(t *testing.T) {
 	vm := NewVM(nil, nil, 0)
 	id := vm.allocJSID()
 	vm.jsObjectItems[id] = make(map[string]Value)
@@ -46,8 +46,37 @@ func TestJScriptObjectShapeTransitionsResetWithRequestObjects(t *testing.T) {
 	if shape == 0 {
 		t.Fatal("object did not receive a shape")
 	}
-	if len(vm.jsShapeTransitions) != 0 || len(vm.jsShapeSlots) != 0 || len(vm.jsShapeSlotIndex) != 0 {
-		t.Fatal("pooled reset retained request-specific shape metadata")
+	if len(vm.jsShapeTransitions) == 0 || len(vm.jsShapeSlots) == 0 || len(vm.jsShapeSlotIndex) == 0 {
+		t.Fatal("pooled reset discarded reusable shape metadata")
+	}
+	if len(vm.jsObjectShape) != 0 || len(vm.jsObjectSlots) != 0 || len(vm.jsObjectShapeDisabled) != 0 {
+		t.Fatal("pooled reset retained request-specific object shape state")
+	}
+
+	secondID := vm.allocJSID()
+	vm.jsObjectItems[secondID] = make(map[string]Value)
+	vm.jsObjectShape[secondID] = 0
+	vm.jsObjectSlots[secondID] = nil
+	vm.jsMemberSet(Value{Type: VTJSObject, Num: secondID}, "alpha", NewInteger(2))
+	if vm.jsObjectShape[secondID] != shape {
+		t.Fatalf("new request did not reuse shape: got %d want %d", vm.jsObjectShape[secondID], shape)
+	}
+}
+
+func TestJScriptObjectShapeCacheIsBounded(t *testing.T) {
+	vm := NewVM(nil, nil, 0)
+	for i := 0; i < jsObjectShapeCacheLimit+1; i++ {
+		id := vm.allocJSID()
+		vm.jsObjectItems[id] = make(map[string]Value)
+		vm.jsObjectShape[id] = 0
+		vm.jsObjectSlots[id] = nil
+		vm.jsMemberSet(Value{Type: VTJSObject, Num: id}, "unique_"+strconv.Itoa(i), NewInteger(int64(i)))
+	}
+	if len(vm.jsShapeTransitions) != jsObjectShapeCacheLimit {
+		t.Fatalf("shape cache exceeded limit: got %d want %d", len(vm.jsShapeTransitions), jsObjectShapeCacheLimit)
+	}
+	if !vm.jsShapeCacheSaturated {
+		t.Fatal("shape cache was not marked saturated")
 	}
 }
 

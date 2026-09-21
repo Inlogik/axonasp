@@ -442,6 +442,7 @@ type VM struct {
 	jsShapeSlots                  map[uint32][]string
 	jsShapeSlotIndex              map[uint32]map[string]uint16
 	jsShapeTransitions            map[jsShapeTransition]uint32
+	jsShapeCacheSaturated         bool
 	jsObjectShapeDisabled         map[int64]struct{}
 	jsNextShapeID                 uint32
 	jsObjectStateItems            map[int64]jsObjectState

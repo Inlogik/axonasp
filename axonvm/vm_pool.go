@@ -976,11 +976,7 @@ func (vm *VM) resetDynamicMaps() {
 	clear(vm.jsObjectKeySet)
 	clear(vm.jsObjectSlots)
 	clear(vm.jsObjectShape)
-	clear(vm.jsShapeSlots)
-	clear(vm.jsShapeSlotIndex)
-	clear(vm.jsShapeTransitions)
 	clear(vm.jsObjectShapeDisabled)
-	vm.jsNextShapeID = 1
 	clear(vm.jsObjectStateItems)
 	clear(vm.jsSymbolStateItems)
 	clear(vm.jsPropertyItems)
