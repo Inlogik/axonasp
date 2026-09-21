@@ -1271,12 +1271,16 @@ func (vm *VM) jsInvalidateObjectIC(objID int64) {
 }
 
 func (vm *VM) jsTransitionObjectShape(objID int64, key string, value Value) bool {
+	if _, disabled := vm.jsObjectShapeDisabled[objID]; disabled {
+		return false
+	}
 	oldShape, tracked := vm.jsObjectShape[objID]
 	if !tracked || strings.HasPrefix(key, jsInternalPropPrefix) {
 		return false
 	}
 	if len(vm.jsShapeSlots[oldShape]) >= jsObjectShapePropertyLimit {
 		vm.jsInvalidateObjectIC(objID)
+		vm.jsObjectShapeDisabled[objID] = struct{}{}
 		return false
 	}
 	if slot, exists := vm.jsShapeSlotIndex[oldShape][key]; exists {
@@ -1317,6 +1321,9 @@ func (vm *VM) jsTransitionObjectShape(objID int64, key string, value Value) bool
 }
 
 func (vm *VM) jsEnsureObjectICLayout(objID int64) bool {
+	if _, disabled := vm.jsObjectShapeDisabled[objID]; disabled {
+		return false
+	}
 	obj, ok := vm.jsObjectItems[objID]
 	if !ok {
 		return false

@@ -425,75 +425,76 @@ type VM struct {
 	jsRegExpItems                  map[int64]*jsRegExpObject
 	// Immutable compiled programs are retained across pooled VM resets. RegExp
 	// instance state (including lastIndex) remains in the request-local object.
-	jsRegExpProgramCache           map[jsRegExpCacheKey]jsRegExpCacheEntry
-	regExpMatchesCollectionItems   map[int64]*regExpMatchesCollection
-	regExpMatchItems               map[int64]*regExpMatch
-	regExpSubMatchesItems          map[int64]*regExpSubMatches
-	regExpSubMatchValueItems       map[int64]*regExpSubMatchValue
-	dictionaryItems                map[int64]*scriptingDictionary
-	collectionItems                map[int64]*vbsCollection
-	collectionEnumeratorItems      map[int64]*vbsCollectionEnumerator
-	nativeObjectProxies            map[int64]nativeObjectProxy
-	jsObjectItems                  map[int64]map[string]Value
-	jsObjectKeyOrder               map[int64][]string
-	jsObjectKeySet                 map[int64]map[string]struct{}
-	jsObjectSlots                  map[int64][]Value
-	jsObjectShape                  map[int64]uint32
-	jsShapeSlots                   map[uint32][]string
-	jsShapeSlotIndex               map[uint32]map[string]uint16
-	jsShapeTransitions             map[jsShapeTransition]uint32
-	jsNextShapeID                  uint32
-	jsObjectStateItems             map[int64]jsObjectState
-	jsSymbolStateItems             map[int64]jsObjectState
-	jsPropertyItems                map[int64]map[string]jsPropertyDescriptor
-	jsFunctionItems                map[int64]*jsFunctionObject
-	jsForInItems                   map[jsLoopEnumeratorKey]*jsForInEnumerator
-	jsForOfItems                   map[jsLoopEnumeratorKey]*jsForOfEnumerator
-	jsEnvItems                     map[int64]*jsEnvFrame
-	jsArgumentsItems               map[int64]*jsArgumentsBinding
-	jsSetItems                     map[int64]map[string]Value
-	jsMapItems                     map[int64]map[string]Value
-	jsWeakRefItems                 map[int64]*jsWeakRef
-	jsFinalizationRegistryItems    map[int64]*jsFinalizationRegistry
-	jsArrayIterators               map[int64]*jsArrayIterator
-	jsStringIterators              map[int64]*jsStringIterator
-	jsRegExpStringIterators        map[int64]*jsRegExpStringIterator
-	jsArrayBuffers                 map[int64][]byte       // backing byte slices for ArrayBuffer objects
-	jsSharedArrayBuffers           map[int64][]byte       // backing byte slices for SharedArrayBuffer objects
-	jsModuleInstances              map[string]*jsEnvFrame // Subphase 8.3: Request-local module registry
-	jsModuleLoading                map[string]struct{}    // Tracks modules currently executing for circular import handling
-	jsIntlDateTimeFormatItems      map[int64]*jsIntlDateTimeFormatObject
-	jsIntlNumberFormatItems        map[int64]*jsIntlNumberFormatObject
-	jsIntlCollatorItems            map[int64]*jsIntlCollatorObject
-	jsIntlPluralRulesItems         map[int64]*jsIntlPluralRulesObject
-	jsIntlRelativeTimeFormatItems  map[int64]*jsIntlRelativeTimeFormatObject
-	jsPromiseItems                 map[int64]*jsPromiseObject
-	jsGeneratorItems               map[int64]*jsGeneratorObject
-	jsProxyItems                   map[int64]*jsProxyObject
-	jsStreamHookItems              map[int64]*jsNodeStreamHookResource
-	jsAsyncFSReadResults           chan jsAsyncFSReadResult
-	jsTimerItems                   map[int64]*jsTimerItem  // active setTimeout/setInterval handles
-	jsTimerResultQueue             chan jsTimerFiredResult // goroutine -> VM thread timer completions
-	jsImmediateQueue               []jsImmediateItem       // setImmediate callbacks
-	jsNextTickQueue                []jsNextTickItem        // process.nextTick callbacks
-	jsPumpingNodeTasks             bool                    // re-entrancy guard for jsPumpNodeAsyncTasks
-	jsMicrotaskQueue               []func()
-	jsProcessingMicrotasks         bool
-	jsSymbolGlobalRegistry         map[string]Value // Symbol.for global registry: description -> Symbol Value
-	jsRegisteredSymbolIDs          map[int64]struct{}
-	jsBufferItems                  map[int64]*jsBuffer // Node.js Buffer instances
-	jsProcessObjectID              int64               // ID of the process global object
-	jsNextSymbolID                 int64
-	jsRootEnvID                    int64                 // ID of the JScript root environment frame
-	jsStrictMode                   bool                  // Current strict mode state
-	jsFunctionStrictModes          map[int64]bool        // Maps function IDs to strict mode status
-	jsBlockScopes                  []map[string]Value    // Stack of block-scoped (let/const) variable values
-	jsBlockScopeConst              []map[string]struct{} // Per block scope: which names are declared const
-	jsBlockScopeTDZ                []map[string]struct{} // Per block scope: which names are in TDZ (const before init)
-	jsBlockScopeDepth              int                   // Current block scope depth
-	errObject                      *asp.ASPError
-	errASPCodeRaw                  string
-	errASPCodeRawSet               bool
+	jsRegExpProgramCache          map[jsRegExpCacheKey]jsRegExpCacheEntry
+	regExpMatchesCollectionItems  map[int64]*regExpMatchesCollection
+	regExpMatchItems              map[int64]*regExpMatch
+	regExpSubMatchesItems         map[int64]*regExpSubMatches
+	regExpSubMatchValueItems      map[int64]*regExpSubMatchValue
+	dictionaryItems               map[int64]*scriptingDictionary
+	collectionItems               map[int64]*vbsCollection
+	collectionEnumeratorItems     map[int64]*vbsCollectionEnumerator
+	nativeObjectProxies           map[int64]nativeObjectProxy
+	jsObjectItems                 map[int64]map[string]Value
+	jsObjectKeyOrder              map[int64][]string
+	jsObjectKeySet                map[int64]map[string]struct{}
+	jsObjectSlots                 map[int64][]Value
+	jsObjectShape                 map[int64]uint32
+	jsShapeSlots                  map[uint32][]string
+	jsShapeSlotIndex              map[uint32]map[string]uint16
+	jsShapeTransitions            map[jsShapeTransition]uint32
+	jsObjectShapeDisabled         map[int64]struct{}
+	jsNextShapeID                 uint32
+	jsObjectStateItems            map[int64]jsObjectState
+	jsSymbolStateItems            map[int64]jsObjectState
+	jsPropertyItems               map[int64]map[string]jsPropertyDescriptor
+	jsFunctionItems               map[int64]*jsFunctionObject
+	jsForInItems                  map[jsLoopEnumeratorKey]*jsForInEnumerator
+	jsForOfItems                  map[jsLoopEnumeratorKey]*jsForOfEnumerator
+	jsEnvItems                    map[int64]*jsEnvFrame
+	jsArgumentsItems              map[int64]*jsArgumentsBinding
+	jsSetItems                    map[int64]map[string]Value
+	jsMapItems                    map[int64]map[string]Value
+	jsWeakRefItems                map[int64]*jsWeakRef
+	jsFinalizationRegistryItems   map[int64]*jsFinalizationRegistry
+	jsArrayIterators              map[int64]*jsArrayIterator
+	jsStringIterators             map[int64]*jsStringIterator
+	jsRegExpStringIterators       map[int64]*jsRegExpStringIterator
+	jsArrayBuffers                map[int64][]byte       // backing byte slices for ArrayBuffer objects
+	jsSharedArrayBuffers          map[int64][]byte       // backing byte slices for SharedArrayBuffer objects
+	jsModuleInstances             map[string]*jsEnvFrame // Subphase 8.3: Request-local module registry
+	jsModuleLoading               map[string]struct{}    // Tracks modules currently executing for circular import handling
+	jsIntlDateTimeFormatItems     map[int64]*jsIntlDateTimeFormatObject
+	jsIntlNumberFormatItems       map[int64]*jsIntlNumberFormatObject
+	jsIntlCollatorItems           map[int64]*jsIntlCollatorObject
+	jsIntlPluralRulesItems        map[int64]*jsIntlPluralRulesObject
+	jsIntlRelativeTimeFormatItems map[int64]*jsIntlRelativeTimeFormatObject
+	jsPromiseItems                map[int64]*jsPromiseObject
+	jsGeneratorItems              map[int64]*jsGeneratorObject
+	jsProxyItems                  map[int64]*jsProxyObject
+	jsStreamHookItems             map[int64]*jsNodeStreamHookResource
+	jsAsyncFSReadResults          chan jsAsyncFSReadResult
+	jsTimerItems                  map[int64]*jsTimerItem  // active setTimeout/setInterval handles
+	jsTimerResultQueue            chan jsTimerFiredResult // goroutine -> VM thread timer completions
+	jsImmediateQueue              []jsImmediateItem       // setImmediate callbacks
+	jsNextTickQueue               []jsNextTickItem        // process.nextTick callbacks
+	jsPumpingNodeTasks            bool                    // re-entrancy guard for jsPumpNodeAsyncTasks
+	jsMicrotaskQueue              []func()
+	jsProcessingMicrotasks        bool
+	jsSymbolGlobalRegistry        map[string]Value // Symbol.for global registry: description -> Symbol Value
+	jsRegisteredSymbolIDs         map[int64]struct{}
+	jsBufferItems                 map[int64]*jsBuffer // Node.js Buffer instances
+	jsProcessObjectID             int64               // ID of the process global object
+	jsNextSymbolID                int64
+	jsRootEnvID                   int64                 // ID of the JScript root environment frame
+	jsStrictMode                  bool                  // Current strict mode state
+	jsFunctionStrictModes         map[int64]bool        // Maps function IDs to strict mode status
+	jsBlockScopes                 []map[string]Value    // Stack of block-scoped (let/const) variable values
+	jsBlockScopeConst             []map[string]struct{} // Per block scope: which names are declared const
+	jsBlockScopeTDZ               []map[string]struct{} // Per block scope: which names are in TDZ (const before init)
+	jsBlockScopeDepth             int                   // Current block scope depth
+	errObject                     *asp.ASPError
+	errASPCodeRaw                 string
+	errASPCodeRawSet              bool
 
 	runtimeClasses      map[string]RuntimeClassDef
 	runtimeClassItems   map[int64]*RuntimeClassInstance
@@ -796,6 +797,7 @@ func NewVM(bytecode []byte, constants []Value, globalCount int) *VM {
 		jsShapeSlots:                   make(map[uint32][]string),
 		jsShapeSlotIndex:               make(map[uint32]map[string]uint16),
 		jsShapeTransitions:             make(map[jsShapeTransition]uint32),
+		jsObjectShapeDisabled:          make(map[int64]struct{}),
 		jsNextShapeID:                  1,
 		jsObjectStateItems:             make(map[int64]jsObjectState),
 		jsSymbolStateItems:             make(map[int64]jsObjectState),

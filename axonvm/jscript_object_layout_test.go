@@ -109,7 +109,17 @@ func TestJScriptLargeObjectStopsTrackingShapeTransitions(t *testing.T) {
 	if _, tracked := vm.jsObjectShape[id]; tracked {
 		t.Fatal("large object retained incremental shape tracking past the limit")
 	}
+	if _, disabled := vm.jsObjectShapeDisabled[id]; !disabled {
+		t.Fatal("large object was not marked as permanently unshaped")
+	}
 	if got := vm.jsObjectItems[id]["key_256"]; got.Type != VTInteger || got.Num != 256 {
 		t.Fatalf("large object lost property value: %#v", got)
+	}
+	transitionCount := len(vm.jsShapeTransitions)
+	if vm.jsEnsureObjectICLayout(id) {
+		t.Fatal("oversized object unexpectedly rebuilt an inline-cache layout")
+	}
+	if len(vm.jsShapeTransitions) != transitionCount {
+		t.Fatal("oversized object created more shape transitions during a later lookup")
 	}
 }

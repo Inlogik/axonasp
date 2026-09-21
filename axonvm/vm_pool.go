@@ -780,6 +780,9 @@ func (vm *VM) ensureDynamicMaps() {
 	if vm.jsShapeTransitions == nil {
 		vm.jsShapeTransitions = make(map[jsShapeTransition]uint32)
 	}
+	if vm.jsObjectShapeDisabled == nil {
+		vm.jsObjectShapeDisabled = make(map[int64]struct{})
+	}
 	if vm.jsNextShapeID == 0 {
 		vm.jsNextShapeID = 1
 	}
@@ -976,6 +979,7 @@ func (vm *VM) resetDynamicMaps() {
 	clear(vm.jsShapeSlots)
 	clear(vm.jsShapeSlotIndex)
 	clear(vm.jsShapeTransitions)
+	clear(vm.jsObjectShapeDisabled)
 	vm.jsNextShapeID = 1
 	clear(vm.jsObjectStateItems)
 	clear(vm.jsSymbolStateItems)
