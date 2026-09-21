@@ -124,6 +124,7 @@ type jsRegExpCacheEntry struct {
 }
 
 const jsRegExpProgramCacheLimit = 1024
+const jsObjectShapePropertyLimit = 256
 
 type jsShapeTransition struct {
 	shapeID uint32
@@ -1272,6 +1273,10 @@ func (vm *VM) jsInvalidateObjectIC(objID int64) {
 func (vm *VM) jsTransitionObjectShape(objID int64, key string, value Value) bool {
 	oldShape, tracked := vm.jsObjectShape[objID]
 	if !tracked || strings.HasPrefix(key, jsInternalPropPrefix) {
+		return false
+	}
+	if len(vm.jsShapeSlots[oldShape]) >= jsObjectShapePropertyLimit {
+		vm.jsInvalidateObjectIC(objID)
 		return false
 	}
 	if slot, exists := vm.jsShapeSlotIndex[oldShape][key]; exists {

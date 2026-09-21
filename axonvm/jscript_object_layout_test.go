@@ -1,6 +1,9 @@
 package axonvm
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+)
 
 func TestJScriptObjectShapeTransitionsAreShared(t *testing.T) {
 	vm := NewVM(nil, nil, 0)
@@ -89,5 +92,24 @@ func TestJScriptShapeMutationAndDeleteSemantics(t *testing.T) {
 	out := runASPSourceForTest(t, source)
 	if out != "5:6:7:4:y:false" {
 		t.Fatalf("unexpected property semantics output: %q", out)
+	}
+}
+
+func TestJScriptLargeObjectStopsTrackingShapeTransitions(t *testing.T) {
+	vm := NewVM(nil, nil, 0)
+	id := vm.allocJSID()
+	vm.jsObjectItems[id] = make(map[string]Value)
+	vm.jsObjectShape[id] = 0
+	vm.jsObjectSlots[id] = nil
+	obj := Value{Type: VTJSObject, Num: id}
+
+	for i := 0; i <= jsObjectShapePropertyLimit; i++ {
+		vm.jsMemberSet(obj, "key_"+strconv.Itoa(i), NewInteger(int64(i)))
+	}
+	if _, tracked := vm.jsObjectShape[id]; tracked {
+		t.Fatal("large object retained incremental shape tracking past the limit")
+	}
+	if got := vm.jsObjectItems[id]["key_256"]; got.Type != VTInteger || got.Num != 256 {
+		t.Fatalf("large object lost property value: %#v", got)
 	}
 }
