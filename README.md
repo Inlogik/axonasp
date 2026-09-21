@@ -178,6 +178,9 @@ Thanks goes to these wonderful people:
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/zydronium"><img src="https://avatars.githubusercontent.com/u/1164978?v=4?s=100" width="100px;" alt="Jelle Luteijn"/><br /><sub><b>Jelle Luteijn</b></sub></a><br /><a href="https://github.com/guimaraeslucas/axonasp/issues?q=author%3Azydronium" title="Bug reports">🐛</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/saborrie"><img src="https://avatars.githubusercontent.com/u/4096734?v=4?s=100" width="100px;" alt="Steven Borrie"/><br /><sub><b>Steven Borrie</b></sub></a><br /><a href="https://github.com/guimaraeslucas/axonasp/issues?q=author%3Asaborrie" title="Bug reports">🐛</a> <a href="https://github.com/guimaraeslucas/axonasp/commits?author=saborrie" title="Code">💻</a></td>
     </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/schotime"><img src="https://avatars.githubusercontent.com/u/202923?v=4?s=100" width="100px;" alt="Adam Schroder"/><br /><sub><b>Adam Schroder</b></sub></a><br /><a href="https://github.com/guimaraeslucas/axonasp/issues?q=author%3Aschotime" title="Bug reports">🐛</a> <a href="https://github.com/guimaraeslucas/axonasp/commits?author=schotime" title="Code">💻</a></td>
+    </tr>
   </tbody>
 </table>
 
