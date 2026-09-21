@@ -1144,6 +1144,26 @@ func TestJScriptArgumentsThisCallAndApply(t *testing.T) {
 	}
 }
 
+func TestJScriptObjectLiteralMethodCapturesFactoryLocal(t *testing.T) {
+	source := `<%@ Language="JScript" %><%
+var helper = function(flag) {
+    var cached;
+    var api = {
+        get: function() {
+            if (!cached) cached = flag ? "new" : "standard";
+            return cached;
+        }
+    };
+    return api;
+}(true);
+Response.Write(helper.get());
+%>`
+
+	if got := runASPSourceForTest(t, source); got != "new" {
+		t.Fatalf("object-literal closure lost factory local: %q", got)
+	}
+}
+
 func TestJScriptNestedFunctionApplyPreservesArguments(t *testing.T) {
 	source := `<script runat="server" language="JScript">` +
 		`function format() { return arguments[0] + ":" + arguments[1] + ":" + arguments[2]; }` +
