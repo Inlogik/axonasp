@@ -1109,6 +1109,14 @@ func (vm *VM) attachDynamicClassResolutionContext(compiler *Compiler) {
 // opcodeOperandSize returns the number of inline operand bytes that follow the opcode byte.
 // This mirrors the IP advances in the main execution loop handlers and is used by the
 // Resume-Next statement-skip mechanism to advance ip past unexecuted opcodes.
+//
+// Truncation contract: the variable-length families (OpJSObjectRest, OpExtPrefix) must read
+// bytecode to resolve their operand width. When those bytes are absent the function returns 0,
+// so a bytecode walker advances exactly one byte and terminates gracefully instead of slicing
+// past the end of the buffer. Fixed-width primary opcodes keep returning their declared width
+// even on a truncated tail because they never dereference bytecode here, and the optimizer
+// passes depend on ip+1+opcodeOperandSize exceeding len(bytecode) to detect that truncation
+// before they read operands themselves.
 func opcodeOperandSize(op OpCode, bytecode []byte, ip int) int {
 	switch op {
 	// 2-byte operands
@@ -1138,8 +1146,18 @@ func opcodeOperandSize(op OpCode, bytecode []byte, ip int) int {
 		return 2
 	case OpJSObjectRest:
 		// countH(1), countL(1) + 2*count operand indices + dynamicCountH(1), dynamicCountL(1)
+		// Bounds guard: a truncated tail cannot supply the 2-byte static count, so the
+		// uint16 read below would slice past the end of the buffer.
+		if ip+3 > len(bytecode) {
+			return 0
+		}
 		count := int(binary.BigEndian.Uint16(bytecode[ip+1:]))
-		return 2 + 2*count + 2
+		size := 2 + 2*count + 2
+		// Bounds guard: the key-index list and the dynamic count must all be present.
+		if ip+1+size > len(bytecode) {
+			return 0
+		}
+		return size
 	// 4-byte operands
 	case OpJump, OpJumpIfFalse, OpJumpIfTrue, OpGotoLabel, OpSet,
 		OpJSJump, OpJSJumpIfFalse, OpJSJumpIfTrue, OpJSTryEnter,
@@ -1158,29 +1176,42 @@ func opcodeOperandSize(op OpCode, bytecode []byte, ip int) int {
 	case OpJSSetProto, OpJSSetThis, OpJSSuperIndexGet, OpJSSuperIndexSet:
 		return 0
 	case OpExtPrefix:
+		// The extended opcode byte is mandatory: a bare OpExtPrefix at the end of a
+		// truncated buffer would panic on bytecode[ip+1]. Return 0 so the caller advances
+		// one byte and terminates gracefully.
+		if ip+1 >= len(bytecode) {
+			return 0
+		}
 		extOp := ExtOpCode(bytecode[ip+1])
+		var size int
 		switch extOp {
 		case ExtOpRegisterClassEvent, ExtOpRaiseEvent, ExtOpWithEventsRegister, ExtOpRegisterClassInterface:
-			return 5
+			size = 5
 		case ExtOpJumpLocalIfFalse, ExtOpJumpGlobalIfFalse, ExtOpJSJumpNameIfFalse:
-			return 7
+			size = 7
 		case ExtOpAddLocalConst, ExtOpSubGlobalConst, ExtOpConcatLocalConst:
-			return 5
+			size = 5
 		case ExtOpConstant2:
-			return 5
+			size = 5
 		case ExtOpConstant3:
-			return 7
+			size = 7
 		case ExtOpConstant4:
-			return 9
+			size = 9
 		case ExtOpFilePrint, ExtOpFileWrite:
-			return 3
+			size = 3
 		case ExtOpFileOpen, ExtOpFileClose, ExtOpFileLineInput, ExtOpFilePut, ExtOpFileGet, ExtOpFileFreeFile, ExtOpAxonASP, ExtOpJSReThrow, ExtOpCloneRecord, ExtOpShiftLeft, ExtOpShiftRight, ExtOpJSWrite:
-			return 1
+			size = 1
 		case ExtOpJSMathSin, ExtOpJSMathCos, ExtOpJSMathTan, ExtOpJSMathAbs, ExtOpJSMathFloor, ExtOpJSMathCeil, ExtOpJSMathRound, ExtOpJSMathSqrt, ExtOpJSMathMin, ExtOpJSMathMax, ExtOpJSMathPow:
-			return 1
+			size = 1
 		default:
-			return 3
+			size = 3
 		}
+		// Bounds guard: size counts the extended opcode byte plus its operands, so the
+		// instruction must end at or before len(bytecode).
+		if ip+1+size > len(bytecode) {
+			return 0
+		}
+		return size
 	// 4-byte operands
 	case OpLine, OpArraySet, OpCallBuiltin, OpSetDirective, OpSetOption, OpJSCallMember, OpJSTailCallMember, OpJSDefineProperty, OpJSSuperCallMember, OpJSExport:
 		return 4
