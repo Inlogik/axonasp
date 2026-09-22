@@ -185,7 +185,7 @@ func TestOpcodeOperandSizeUnknownExtOpDefaultWidth(t *testing.T) {
 // firstUnknownExtOpcode returns a byte value that ExtOpCode.String does not name, which means
 // the extended dispatch in opcodeOperandSize routes it through the default width.
 func firstUnknownExtOpcode() (byte, bool) {
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		if ExtOpCode(i).String() == "ExtOpUnknown" {
 			return byte(i), true
 		}
@@ -204,7 +204,7 @@ func TestOpcodeOperandSizeNeverReadsPastBuffer(t *testing.T) {
 		return op == OpExtPrefix || op == OpJSObjectRest
 	}
 
-	for value := 0; value < 256; value++ {
+	for value := range 256 {
 		for length := 1; length <= 16; length++ {
 			for _, fill := range fills {
 				bytecode := make([]byte, length)

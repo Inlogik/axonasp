@@ -1395,6 +1395,10 @@ func TestJScriptCoercionMathDateAndRegex(t *testing.T) {
 	}
 }
 
+// TestJScriptSelfExpandingReplaceLoopFailsFast verifies the cumulative string work guard stops a
+// self-expanding replace loop. The script timeout is deliberately far above the guard budget so
+// the wall clock cannot win the race: the only way out of the runaway loop is the watchdog, and a
+// watchdog regression surfaces as a script timeout failure instead of a silent pass.
 func TestJScriptSelfExpandingReplaceLoopFailsFast(t *testing.T) {
 	source := `<%@ Language="JScript" %>` +
 		`<script runat="server" language="JScript">` +
@@ -1415,7 +1419,7 @@ func TestJScriptSelfExpandingReplaceLoopFailsFast(t *testing.T) {
 	vm := NewVM(compiler.Bytecode(), compiler.Constants(), compiler.GlobalsCount())
 	host := NewMockHost()
 	host.Response().SetBuffer(false)
-	if err := host.Server().SetScriptTimeout(2); err != nil {
+	if err := host.Server().SetScriptTimeout(30); err != nil {
 		t.Fatalf("set timeout failed: %v", err)
 	}
 	vm.SetHost(host)
@@ -1424,7 +1428,7 @@ func TestJScriptSelfExpandingReplaceLoopFailsFast(t *testing.T) {
 		t.Fatalf("expected runtime error for runaway self-expanding replace loop")
 	}
 	errText := strings.ToLower(err.Error())
-	if !strings.Contains(errText, "out of string") && !strings.Contains(errText, "string work exceeded") && !strings.Contains(errText, "loop iteration limit") {
+	if !strings.Contains(errText, "out of string") && !strings.Contains(errText, "string work exceeded") {
 		t.Fatalf("expected fast-fail watchdog, got: %v", err)
 	}
 }

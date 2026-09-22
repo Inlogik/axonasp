@@ -23,6 +23,7 @@ package axonvm
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -95,6 +96,36 @@ func executeOptimizerProgram(source, sourceName, includeSiteRoot string) optimiz
 	}
 	host.Response().Flush()
 	return optimizerOutcome{status: "ok", detail: output.String()}
+}
+
+// deadJumpCorpusExecutionTimeout is the hard wall-clock cap for one corpus page execution.
+// The engine's one second script timeout normally aborts a runaway page first, so this guard
+// only fires when a page blocks below the script timeout check and would otherwise wedge the
+// test binary instead of reporting a failure.
+const deadJumpCorpusExecutionTimeout = 30 * time.Second
+
+// executeOptimizerProgramWithinDeadline runs one page with the dead conditional jump pass
+// enabled or disabled under a hard execution timeout. It returns the observable outcome, or a
+// timeout error when the page fails to make progress within deadJumpCorpusExecutionTimeout.
+func executeOptimizerProgramWithinDeadline(pageName, source, absPath string, optimized bool) (optimizerOutcome, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), deadJumpCorpusExecutionTimeout)
+	defer cancel()
+
+	done := make(chan optimizerOutcome, 1)
+	go func() {
+		var outcome optimizerOutcome
+		withDeadConditionalJumpOptimizer(optimized, func() {
+			outcome = executeOptimizerProgram(source, absPath, "")
+		})
+		done <- outcome
+	}()
+
+	select {
+	case outcome := <-done:
+		return outcome, nil
+	case <-ctx.Done():
+		return optimizerOutcome{}, fmt.Errorf("%s: exceeded the hard %s execution timeout", pageName, deadJumpCorpusExecutionTimeout)
+	}
 }
 
 // executeOptimizerProgramBoth compiles and executes one program with the optimizer enabled
@@ -734,15 +765,17 @@ func TestDeadJumpOptimizationCorpusIdentity(t *testing.T) {
 
 		var optimized, unoptimized optimizerOutcome
 		runOptimized := func() {
-			withDeadConditionalJumpOptimizer(true, func() {
-				optimized = executeOptimizerProgram(source, absPath, "")
-			})
+			outcome, err := executeOptimizerProgramWithinDeadline(relative, source, absPath, true)
+			if err != nil {
+				t.Fatalf("%s: optimized run %v", path, err)
+			}
+			optimized = outcome
 		}
 		runUnoptimized := func() optimizerOutcome {
-			var outcome optimizerOutcome
-			withDeadConditionalJumpOptimizer(false, func() {
-				outcome = executeOptimizerProgram(source, absPath, "")
-			})
+			outcome, err := executeOptimizerProgramWithinDeadline(relative, source, absPath, false)
+			if err != nil {
+				t.Fatalf("%s: unoptimized run %v", path, err)
+			}
 			unoptimized = outcome
 			return outcome
 		}
