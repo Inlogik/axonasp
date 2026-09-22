@@ -5827,6 +5827,11 @@ func (vm *VM) jsPrepareMemberCallee(target Value, member string) (Value, Value, 
 	if !vm.jsIsCallable(callee) {
 		return Value{Type: VTJSUndefined}, Value{Type: VTJSUndefined}, false, false
 	}
+	// Synthetic prototype methods dispatch back through jsCallMember. Let that
+	// path handle native functions while user-defined replacements run normally.
+	if callee.Type == VTJSFunction && vm.jsFunctionItems[callee.Num] == nil {
+		return Value{Type: VTJSUndefined}, Value{Type: VTJSUndefined}, false, false
+	}
 	return callee, target, true, false
 }
 
@@ -5853,7 +5858,6 @@ func (vm *VM) jsCallMember(target Value, member string, args []Value) (Value, bo
 			}
 		}
 	}
-
 	if target.Type == VTJSFunction {
 		switch {
 		case strings.EqualFold(member, "toString"), strings.EqualFold(member, "toLocaleString"):

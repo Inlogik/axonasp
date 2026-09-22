@@ -4619,7 +4619,8 @@ aspExecLoop:
 			target := vm.pop()
 			member := vm.constants[nameIdx].Str
 			stackLen := len(vm.jsCallStack)
-			if (target.Type == VTJSObject || target.Type == VTJSFunction) && vm.jsObjectStringProperty(target, "__js_type") == "" {
+			if ((target.Type == VTJSObject || target.Type == VTJSFunction) && vm.jsObjectStringProperty(target, "__js_type") == "") ||
+				target.Type == VTArray || target.Type == VTString || target.Type == VTDate || target.Type == VTInteger || target.Type == VTDouble || target.Type == VTBool {
 				if callee, thisVal, ok, deferred := vm.jsPrepareMemberCallee(target, member); deferred {
 					continue
 				} else if ok && vm.jsBeginDirectCall(callee, thisVal, args) {
@@ -4645,7 +4646,8 @@ aspExecLoop:
 			target := vm.pop()
 			key := vm.jsPropertyKeyFromValue(keyVal)
 			stackLen := len(vm.jsCallStack)
-			if (target.Type == VTJSObject || target.Type == VTJSFunction) && vm.jsObjectStringProperty(target, "__js_type") == "" {
+			if ((target.Type == VTJSObject || target.Type == VTJSFunction) && vm.jsObjectStringProperty(target, "__js_type") == "") ||
+				target.Type == VTArray || target.Type == VTString || target.Type == VTDate || target.Type == VTInteger || target.Type == VTDouble || target.Type == VTBool {
 				if callee, thisVal, ok, deferred := vm.jsPrepareMemberCallee(target, key); deferred {
 					continue
 				} else if ok && vm.jsBeginDirectCall(callee, thisVal, args) {
