@@ -423,74 +423,80 @@ type VM struct {
 	adodbFieldItems                map[int64]*adodbFieldProxy
 	regExpItems                    map[int64]*regExpNativeObject
 	jsRegExpItems                  map[int64]*jsRegExpObject
-	regExpMatchesCollectionItems   map[int64]*regExpMatchesCollection
-	regExpMatchItems               map[int64]*regExpMatch
-	regExpSubMatchesItems          map[int64]*regExpSubMatches
-	regExpSubMatchValueItems       map[int64]*regExpSubMatchValue
-	dictionaryItems                map[int64]*scriptingDictionary
-	collectionItems                map[int64]*vbsCollection
-	collectionEnumeratorItems      map[int64]*vbsCollectionEnumerator
-	nativeObjectProxies            map[int64]nativeObjectProxy
-	jsObjectItems                  map[int64]map[string]Value
-	jsObjectKeyOrder               map[int64][]string
-	jsObjectKeySet                 map[int64]map[string]struct{}
-	jsObjectSlots                  map[int64][]Value
-	jsObjectSlotIndex              map[int64]map[string]uint16
-	jsObjectShape                  map[int64]uint32
-	jsShapeSlots                   map[uint32][]string
-	jsShapeBySignature             map[string]uint32
-	jsNextShapeID                  uint32
-	jsObjectStateItems             map[int64]jsObjectState
-	jsSymbolStateItems             map[int64]jsObjectState
-	jsPropertyItems                map[int64]map[string]jsPropertyDescriptor
-	jsFunctionItems                map[int64]*jsFunctionObject
-	jsForInItems                   map[jsLoopEnumeratorKey]*jsForInEnumerator
-	jsForOfItems                   map[jsLoopEnumeratorKey]*jsForOfEnumerator
-	jsEnvItems                     map[int64]*jsEnvFrame
-	jsArgumentsItems               map[int64]*jsArgumentsBinding
-	jsSetItems                     map[int64]map[string]Value
-	jsMapItems                     map[int64]map[string]Value
-	jsWeakRefItems                 map[int64]*jsWeakRef
-	jsFinalizationRegistryItems    map[int64]*jsFinalizationRegistry
-	jsArrayIterators               map[int64]*jsArrayIterator
-	jsStringIterators              map[int64]*jsStringIterator
-	jsRegExpStringIterators        map[int64]*jsRegExpStringIterator
-	jsArrayBuffers                 map[int64][]byte       // backing byte slices for ArrayBuffer objects
-	jsSharedArrayBuffers           map[int64][]byte       // backing byte slices for SharedArrayBuffer objects
-	jsModuleInstances              map[string]*jsEnvFrame // Subphase 8.3: Request-local module registry
-	jsModuleLoading                map[string]struct{}    // Tracks modules currently executing for circular import handling
-	jsIntlDateTimeFormatItems      map[int64]*jsIntlDateTimeFormatObject
-	jsIntlNumberFormatItems        map[int64]*jsIntlNumberFormatObject
-	jsIntlCollatorItems            map[int64]*jsIntlCollatorObject
-	jsIntlPluralRulesItems         map[int64]*jsIntlPluralRulesObject
-	jsIntlRelativeTimeFormatItems  map[int64]*jsIntlRelativeTimeFormatObject
-	jsPromiseItems                 map[int64]*jsPromiseObject
-	jsGeneratorItems               map[int64]*jsGeneratorObject
-	jsProxyItems                   map[int64]*jsProxyObject
-	jsStreamHookItems              map[int64]*jsNodeStreamHookResource
-	jsAsyncFSReadResults           chan jsAsyncFSReadResult
-	jsTimerItems                   map[int64]*jsTimerItem  // active setTimeout/setInterval handles
-	jsTimerResultQueue             chan jsTimerFiredResult // goroutine -> VM thread timer completions
-	jsImmediateQueue               []jsImmediateItem       // setImmediate callbacks
-	jsNextTickQueue                []jsNextTickItem        // process.nextTick callbacks
-	jsPumpingNodeTasks             bool                    // re-entrancy guard for jsPumpNodeAsyncTasks
-	jsMicrotaskQueue               []func()
-	jsProcessingMicrotasks         bool
-	jsSymbolGlobalRegistry         map[string]Value // Symbol.for global registry: description -> Symbol Value
-	jsRegisteredSymbolIDs          map[int64]struct{}
-	jsBufferItems                  map[int64]*jsBuffer // Node.js Buffer instances
-	jsProcessObjectID              int64               // ID of the process global object
-	jsNextSymbolID                 int64
-	jsRootEnvID                    int64                 // ID of the JScript root environment frame
-	jsStrictMode                   bool                  // Current strict mode state
-	jsFunctionStrictModes          map[int64]bool        // Maps function IDs to strict mode status
-	jsBlockScopes                  []map[string]Value    // Stack of block-scoped (let/const) variable values
-	jsBlockScopeConst              []map[string]struct{} // Per block scope: which names are declared const
-	jsBlockScopeTDZ                []map[string]struct{} // Per block scope: which names are in TDZ (const before init)
-	jsBlockScopeDepth              int                   // Current block scope depth
-	errObject                      *asp.ASPError
-	errASPCodeRaw                  string
-	errASPCodeRawSet               bool
+	// Immutable compiled programs are retained across pooled VM resets. RegExp
+	// instance state (including lastIndex) remains in the request-local object.
+	jsRegExpProgramCache          map[jsRegExpCacheKey]jsRegExpCacheEntry
+	regExpMatchesCollectionItems  map[int64]*regExpMatchesCollection
+	regExpMatchItems              map[int64]*regExpMatch
+	regExpSubMatchesItems         map[int64]*regExpSubMatches
+	regExpSubMatchValueItems      map[int64]*regExpSubMatchValue
+	dictionaryItems               map[int64]*scriptingDictionary
+	collectionItems               map[int64]*vbsCollection
+	collectionEnumeratorItems     map[int64]*vbsCollectionEnumerator
+	nativeObjectProxies           map[int64]nativeObjectProxy
+	jsObjectItems                 map[int64]map[string]Value
+	jsObjectKeyOrder              map[int64][]string
+	jsObjectKeySet                map[int64]map[string]struct{}
+	jsObjectSlots                 map[int64][]Value
+	jsObjectShape                 map[int64]uint32
+	jsShapeSlots                  map[uint32][]string
+	jsShapeSlotIndex              map[uint32]map[string]uint16
+	jsShapeTransitions            map[jsShapeTransition]uint32
+	jsShapeCacheSaturated         bool
+	jsObjectShapeDisabled         map[int64]struct{}
+	jsNextShapeID                 uint32
+	jsObjectStateItems            map[int64]jsObjectState
+	jsSymbolStateItems            map[int64]jsObjectState
+	jsPropertyItems               map[int64]map[string]jsPropertyDescriptor
+	jsFunctionItems               map[int64]*jsFunctionObject
+	jsForInItems                  map[jsLoopEnumeratorKey]*jsForInEnumerator
+	jsForOfItems                  map[jsLoopEnumeratorKey]*jsForOfEnumerator
+	jsEnvItems                    map[int64]*jsEnvFrame
+	jsEnvBindingsPool             []map[string]Value
+	jsArgumentsItems              map[int64]*jsArgumentsBinding
+	jsSetItems                    map[int64]map[string]Value
+	jsMapItems                    map[int64]map[string]Value
+	jsWeakRefItems                map[int64]*jsWeakRef
+	jsFinalizationRegistryItems   map[int64]*jsFinalizationRegistry
+	jsArrayIterators              map[int64]*jsArrayIterator
+	jsStringIterators             map[int64]*jsStringIterator
+	jsRegExpStringIterators       map[int64]*jsRegExpStringIterator
+	jsArrayBuffers                map[int64][]byte       // backing byte slices for ArrayBuffer objects
+	jsSharedArrayBuffers          map[int64][]byte       // backing byte slices for SharedArrayBuffer objects
+	jsModuleInstances             map[string]*jsEnvFrame // Subphase 8.3: Request-local module registry
+	jsModuleLoading               map[string]struct{}    // Tracks modules currently executing for circular import handling
+	jsIntlDateTimeFormatItems     map[int64]*jsIntlDateTimeFormatObject
+	jsIntlNumberFormatItems       map[int64]*jsIntlNumberFormatObject
+	jsIntlCollatorItems           map[int64]*jsIntlCollatorObject
+	jsIntlPluralRulesItems        map[int64]*jsIntlPluralRulesObject
+	jsIntlRelativeTimeFormatItems map[int64]*jsIntlRelativeTimeFormatObject
+	jsPromiseItems                map[int64]*jsPromiseObject
+	jsGeneratorItems              map[int64]*jsGeneratorObject
+	jsProxyItems                  map[int64]*jsProxyObject
+	jsStreamHookItems             map[int64]*jsNodeStreamHookResource
+	jsAsyncFSReadResults          chan jsAsyncFSReadResult
+	jsTimerItems                  map[int64]*jsTimerItem  // active setTimeout/setInterval handles
+	jsTimerResultQueue            chan jsTimerFiredResult // goroutine -> VM thread timer completions
+	jsImmediateQueue              []jsImmediateItem       // setImmediate callbacks
+	jsNextTickQueue               []jsNextTickItem        // process.nextTick callbacks
+	jsPumpingNodeTasks            bool                    // re-entrancy guard for jsPumpNodeAsyncTasks
+	jsMicrotaskQueue              []func()
+	jsProcessingMicrotasks        bool
+	jsSymbolGlobalRegistry        map[string]Value // Symbol.for global registry: description -> Symbol Value
+	jsRegisteredSymbolIDs         map[int64]struct{}
+	jsBufferItems                 map[int64]*jsBuffer // Node.js Buffer instances
+	jsProcessObjectID             int64               // ID of the process global object
+	jsNextSymbolID                int64
+	jsRootEnvID                   int64                 // ID of the JScript root environment frame
+	jsStrictMode                  bool                  // Current strict mode state
+	jsFunctionStrictModes         map[int64]bool        // Maps function IDs to strict mode status
+	jsBlockScopes                 []map[string]Value    // Stack of block-scoped (let/const) variable values
+	jsBlockScopeConst             []map[string]struct{} // Per block scope: which names are declared const
+	jsBlockScopeTDZ               []map[string]struct{} // Per block scope: which names are in TDZ (const before init)
+	jsBlockScopeDepth             int                   // Current block scope depth
+	errObject                     *asp.ASPError
+	errASPCodeRaw                 string
+	errASPCodeRawSet              bool
 
 	runtimeClasses      map[string]RuntimeClassDef
 	runtimeClassItems   map[int64]*RuntimeClassInstance
@@ -574,6 +580,9 @@ type VM struct {
 	sourceMap            SourceMap         // Sparse merged-to-original source line mapping for include-aware errors.
 	dynamicProgramStarts map[uint64]int    // Per-VM start offsets for already-appended cached dynamic fragments.
 	jsStringWorkBytes    int64             // Per-run cumulative bytes produced by JScript string operations.
+	// Decoded immutable metadata keyed by function-template constant index.
+	// Retained across pooled VM resets for the base compiled program.
+	jsFunctionTemplateMetadataCache []*jsFunctionTemplateMetadata
 
 	RecordDecls      []CompiledRecordDecl
 	RecordDeclLookup map[string]int
@@ -773,6 +782,7 @@ func NewVM(bytecode []byte, constants []Value, globalCount int) *VM {
 		adodbFieldItems:                make(map[int64]*adodbFieldProxy),
 		regExpItems:                    make(map[int64]*regExpNativeObject),
 		jsRegExpItems:                  make(map[int64]*jsRegExpObject),
+		jsRegExpProgramCache:           make(map[jsRegExpCacheKey]jsRegExpCacheEntry),
 		regExpMatchesCollectionItems:   make(map[int64]*regExpMatchesCollection),
 		regExpMatchItems:               make(map[int64]*regExpMatch),
 		regExpSubMatchesItems:          make(map[int64]*regExpSubMatches),
@@ -785,10 +795,11 @@ func NewVM(bytecode []byte, constants []Value, globalCount int) *VM {
 		jsObjectKeyOrder:               make(map[int64][]string),
 		jsObjectKeySet:                 make(map[int64]map[string]struct{}),
 		jsObjectSlots:                  make(map[int64][]Value),
-		jsObjectSlotIndex:              make(map[int64]map[string]uint16),
 		jsObjectShape:                  make(map[int64]uint32),
 		jsShapeSlots:                   make(map[uint32][]string),
-		jsShapeBySignature:             make(map[string]uint32),
+		jsShapeSlotIndex:               make(map[uint32]map[string]uint16),
+		jsShapeTransitions:             make(map[jsShapeTransition]uint32),
+		jsObjectShapeDisabled:          make(map[int64]struct{}),
 		jsNextShapeID:                  1,
 		jsObjectStateItems:             make(map[int64]jsObjectState),
 		jsSymbolStateItems:             make(map[int64]jsObjectState),
@@ -4711,7 +4722,7 @@ aspExecLoop:
 		case OpJSCreateClosure:
 			templateIdx := binary.BigEndian.Uint16(vm.bytecode[vm.ip:])
 			vm.ip += 2
-			vm.push(vm.jsCreateClosure(vm.constants[templateIdx]))
+			vm.push(vm.jsCreateClosure(templateIdx))
 
 		case OpJSDefineProperty:
 			nameIdx := binary.BigEndian.Uint16(vm.bytecode[vm.ip:])
@@ -4846,9 +4857,7 @@ aspExecLoop:
 			}
 			vm.jsObjectItems[objID] = obj
 			vm.jsObjectSlots[objID] = make([]Value, 0, 8)
-			vm.jsObjectSlotIndex[objID] = make(map[string]uint16, 8)
 			vm.jsObjectShape[objID] = 0
-			vm.jsPropertyItems[objID] = make(map[string]jsPropertyDescriptor, 8)
 			vm.push(Value{Type: VTJSObject, Num: objID})
 
 		case OpJSNewArray:
@@ -5760,7 +5769,7 @@ aspExecLoop:
 			vm.ip += 2
 			vm.ensureJSRootEnv()
 			parentID := vm.jsActiveEnvID
-			childID := vm.allocJSID()
+			childID := vm.allocJSEnvID()
 			bindings := make(map[string]Value, numVars+2)
 			for range numVars {
 				nameIdx := binary.BigEndian.Uint16(vm.bytecode[vm.ip:])
@@ -6579,9 +6588,11 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 			return NewInteger(0)
 		case strings.EqualFold(member, "CodePage"):
 			if len(args) >= 1 {
+				codePage := vm.asInt(args[0])
+				response.SetCodePage(codePage)
 				session := vm.host.Session()
 				if session != nil {
-					session.SetCodePage(vm.asInt(args[0]))
+					session.SetCodePage(codePage)
 				}
 				return Value{Type: VTEmpty}
 			}
@@ -6725,9 +6736,6 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 				if value, ok := request.ServerVars.GetValue(key); ok {
 					return vm.newRequestCollectionValueItem(value)
 				}
-				// Request("missing") is still an IIS Request collection value.
-				// Preserve that distinction so string coercion yields "" while
-				// numeric JScript coercion yields NaN rather than zero.
 				return vm.newRequestCollectionValueItem(asp.RequestCollectionValue{})
 			}
 			return emptyForCtx()
@@ -6982,17 +6990,17 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 		switch {
 		case strings.EqualFold(member, "HTMLEncode"):
 			if len(args) >= 1 {
-				return NewString(server.HTMLEncode(args[0].String()))
+				return NewString(server.HTMLEncode(vm.valueToString(args[0])))
 			}
 			return NewString("")
 		case strings.EqualFold(member, "URLEncode"):
 			if len(args) >= 1 {
-				return NewString(server.URLEncode(args[0].String()))
+				return NewString(server.URLEncode(vm.valueToString(args[0])))
 			}
 			return NewString("")
 		case strings.EqualFold(member, "URLPathEncode"):
 			if len(args) >= 1 {
-				return NewString(server.URLPathEncode(args[0].String()))
+				return NewString(server.URLPathEncode(vm.valueToString(args[0])))
 			}
 			return NewString("")
 		case strings.EqualFold(member, "MapPath"):
@@ -8405,8 +8413,10 @@ func (vm *VM) dispatchMemberSet(objID int64, member string, val Value) {
 				vm.host.Session().SetLCID(vm.asInt(val))
 			}
 		case strings.EqualFold(member, "CodePage"):
+			codePage := vm.asInt(val)
+			vm.host.Response().SetCodePage(codePage)
 			if vm.host != nil && vm.host.Session() != nil {
-				vm.host.Session().SetCodePage(vm.asInt(val))
+				vm.host.Session().SetCodePage(codePage)
 			}
 		}
 		return
