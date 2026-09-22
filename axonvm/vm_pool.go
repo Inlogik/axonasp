@@ -76,6 +76,33 @@ func releaseVMPoolSlot(slot chan struct{}) {
 	}
 }
 
+// PurgeVMProgramPools drops every idle VM retained by the interpreter pools and
+// stops their STA workers. Hosted runtimes call this when their module is
+// unloaded so pooled VM instances, dynamic maps and bytecode views do not
+// outlive the owner across configuration reloads.
+func PurgeVMProgramPools() {
+	cachedProgramPools.Range(func(key, value any) bool {
+		cachedProgramPools.Delete(key)
+
+		pool, ok := value.(*vmProgramPool)
+		if !ok || pool == nil {
+			return true
+		}
+
+		pool.mu.Lock()
+		idle := pool.items
+		pool.items = nil
+		pool.mu.Unlock()
+
+		for _, vm := range idle {
+			if vm != nil {
+				vm.stopSTAWorker()
+			}
+		}
+		return true
+	})
+}
+
 // AcquireVMFromCachedProgram borrows one VM instance from the interpreter pool.
 func AcquireVMFromCachedProgram(program CachedProgram) *VM {
 	slot := acquireVMPoolSlot()
