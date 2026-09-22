@@ -141,7 +141,8 @@ func TestJScriptLargeObjectStopsTrackingShapeTransitions(t *testing.T) {
 	if _, disabled := vm.jsObjectShapeDisabled[id]; !disabled {
 		t.Fatal("large object was not marked as permanently unshaped")
 	}
-	if got := vm.jsObjectItems[id]["key_256"]; got.Type != VTInteger || got.Num != 256 {
+	lastKey := "key_" + strconv.Itoa(jsObjectShapePropertyLimit)
+	if got := vm.jsObjectItems[id][lastKey]; got.Type != VTInteger || got.Num != int64(jsObjectShapePropertyLimit) {
 		t.Fatalf("large object lost property value: %#v", got)
 	}
 	transitionCount := len(vm.jsShapeTransitions)

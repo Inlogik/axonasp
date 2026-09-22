@@ -436,7 +436,6 @@ type VM struct {
 	nativeObjectProxies           map[int64]nativeObjectProxy
 	jsObjectItems                 map[int64]map[string]Value
 	jsObjectKeyOrder              map[int64][]string
-	jsObjectKeySet                map[int64]map[string]struct{}
 	jsObjectSlots                 map[int64][]Value
 	jsObjectShape                 map[int64]uint32
 	jsShapeSlots                  map[uint32][]string
@@ -793,7 +792,6 @@ func NewVM(bytecode []byte, constants []Value, globalCount int) *VM {
 		nativeObjectProxies:            make(map[int64]nativeObjectProxy),
 		jsObjectItems:                  make(map[int64]map[string]Value),
 		jsObjectKeyOrder:               make(map[int64][]string),
-		jsObjectKeySet:                 make(map[int64]map[string]struct{}),
 		jsObjectSlots:                  make(map[int64][]Value),
 		jsObjectShape:                  make(map[int64]uint32),
 		jsShapeSlots:                   make(map[uint32][]string),
@@ -1864,7 +1862,6 @@ func (vm *VM) syncExecuteGlobalState(child *VM) {
 	vm.nativeObjectProxies = child.nativeObjectProxies
 	vm.jsObjectItems = child.jsObjectItems
 	vm.jsObjectKeyOrder = child.jsObjectKeyOrder
-	vm.jsObjectKeySet = child.jsObjectKeySet
 	vm.jsObjectStateItems = child.jsObjectStateItems
 	vm.jsPropertyItems = child.jsPropertyItems
 	vm.jsFunctionItems = child.jsFunctionItems
@@ -4856,7 +4853,6 @@ aspExecLoop:
 				obj["__js_proto"] = proto
 			}
 			vm.jsObjectItems[objID] = obj
-			vm.jsObjectSlots[objID] = make([]Value, 0, 8)
 			vm.jsObjectShape[objID] = 0
 			vm.push(Value{Type: VTJSObject, Num: objID})
 

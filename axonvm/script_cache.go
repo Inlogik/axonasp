@@ -837,7 +837,7 @@ func (c *ScriptCache) Put(filePath string, program CachedProgram, dependencies [
 	}
 	cacheKey := normalizeScriptCacheKey(normalized)
 
-	program = immutableCachedProgramView(program)
+	program = cloneCachedProgram(program)
 	sizeBytes := estimateProgramSizeBytes(program)
 	if sizeBytes <= 0 {
 		return
@@ -993,8 +993,7 @@ func (c *ScriptCache) LoadOrCompileWithModeAndOptions(filePath string, mode Exec
 		if c.mode.HasMemoryTier() {
 			c.putByCacheKey(cacheKey, program, program.IncludeDependencies, estimateProgramSizeBytes(program))
 		}
-		result := immutableCachedProgramView(program)
-		return &result, nil
+		return &program, nil
 	})
 
 	if err != nil {
@@ -1085,7 +1084,7 @@ func (c *ScriptCache) loadDiskProgram(filePath string, sourceInfo os.FileInfo) (
 		payload.Program.SourceName,
 		payload.Program.Constants,
 	)
-	return immutableCachedProgramView(payload.Program), true
+	return immutableCachedProgramViewNoClone(payload.Program), true
 }
 
 // storeDiskProgram persists one compiled program into its .aspb cache file.
@@ -1134,7 +1133,6 @@ func (c *ScriptCache) storeDiskProgram(filePath string, sourceModTime time.Time,
 
 // NewVMFromCachedProgram creates a VM instance from cached compilation output.
 func NewVMFromCachedProgram(program CachedProgram) *VM {
-	program = immutableCachedProgramView(program)
 	vm := NewVM(program.Bytecode, program.Constants, program.GlobalCount)
 	vm.optionCompare = program.OptionCompare
 	vm.optionExplicit = program.OptionExplicit
@@ -1535,7 +1533,7 @@ func (c *ScriptCache) getByCacheKey(cacheKey string) (CachedProgram, bool) {
 	if !ok {
 		return CachedProgram{}, false
 	}
-	return immutableCachedProgramView(program), true
+	return immutableCachedProgramViewNoClone(program), true
 }
 
 func (c *ScriptCache) putByCacheKey(cacheKey string, program CachedProgram, dependencies []string, sizeBytes int64) {
@@ -1548,7 +1546,6 @@ func (c *ScriptCache) putByCacheKey(cacheKey string, program CachedProgram, depe
 			return
 		}
 	}
-	program = immutableCachedProgramView(program)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if sizeBytes > c.maxBytes {
@@ -1939,6 +1936,13 @@ func cloneIntMap(values map[string]int) map[string]int {
 // immutableCachedProgramView returns one non-allocating immutable view of cache payload slices.
 // The returned struct aliases backing arrays and must be treated as read-only.
 func immutableCachedProgramView(program CachedProgram) CachedProgram {
+	program = cloneCachedProgram(program)
+	return immutableCachedProgramViewNoClone(program)
+}
+
+// immutableCachedProgramViewNoClone restricts slice capacity without copying.
+// It is used only for cache-owned payloads that callers treat as read-only.
+func immutableCachedProgramViewNoClone(program CachedProgram) CachedProgram {
 	program.Bytecode = immutableBytecodeView(program.Bytecode)
 	program.Constants = immutableValueView(program.Constants)
 	program.GlobalPreludeNames = immutableStringView(program.GlobalPreludeNames)
@@ -1955,21 +1959,11 @@ func immutableCachedProgramView(program CachedProgram) CachedProgram {
 	program.GlobalNamesLower = immutableStringView(program.GlobalNamesLower)
 	program.RecordDecls = immutableRecordDeclView(program.RecordDecls)
 
-	// Clone constants to avoid mutating shared Value.Names fields under concurrent access.
-	if len(program.Constants) > 0 {
-		cloned := make([]Value, len(program.Constants))
-		copy(cloned, program.Constants)
-		for i := range cloned {
-			cloned[i].Names = immutableStringView(cloned[i].Names)
-		}
-		program.Constants = cloned[:len(cloned):len(cloned)]
+	for i := range program.Constants {
+		program.Constants[i].Names = immutableStringView(program.Constants[i].Names)
 	}
-	if len(program.FuncParamDefaults) > 0 {
-		cloned := make(map[int][]int, len(program.FuncParamDefaults))
-		for key, values := range program.FuncParamDefaults {
-			cloned[key] = immutableIntView(values)
-		}
-		program.FuncParamDefaults = cloned
+	for key, values := range program.FuncParamDefaults {
+		program.FuncParamDefaults[key] = immutableIntView(values)
 	}
 
 	return program
