@@ -2079,6 +2079,17 @@ func TestJScriptES5StringMethodsSurface(t *testing.T) {
 	}
 }
 
+func TestJScriptArrayPrototypeOverrideTakesPrecedence(t *testing.T) {
+	source := `<script runat="server" language="JScript">` +
+		`Array.prototype.indexOf = function() { return 42; };` +
+		`Response.Write([3].indexOf("3"));` +
+		`</script>`
+	out := runASPSourceForTest(t, source)
+	if out != "42" {
+		t.Fatalf("array prototype override was bypassed: %q", out)
+	}
+}
+
 func TestJScriptES5ArrayMethodsSurface(t *testing.T) {
 	source := `<script runat="server" language="JScript">` +
 		`var a = [1,2,3,4];` +
