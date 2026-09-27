@@ -210,6 +210,12 @@ type Compiler struct {
 	staticLocals         map[string]int               // Static local variables mapping (localName -> globalIndex)
 	constLiteralGlobals  map[string]Value             // Compile-time known global constant values
 	isLocal              bool                         // True if currently compiling a Sub/Function
+	// insideClassMethod is true only while compiling the body of a Class member
+	// procedure (Sub, Function, Property Get/Let/Set). Microsoft VBScript does not
+	// enforce Option Explicit inside Class member bodies, so an assignment to an
+	// undeclared name must create an implicit procedure-local variable there
+	// instead of raising "Variable not defined" (800A01F4).
+	insideClassMethod bool
 
 	// Compilation Options
 	optionExplicit         bool // Requires variables to be Dim'ed
@@ -1510,7 +1516,9 @@ func (c *Compiler) resolveVar(name string) (OpCode, int) {
 	if idx, exists := c.Globals.Get(name); exists {
 		isTrueGlobal := idx < c.userGlobalsStart || c.declaredGlobals[lower] || c.constGlobals[lower] || c.implicitGlobals[lower]
 		if c.isLocal && !isTrueGlobal {
-			if c.optionExplicit {
+			// Class member bodies are exempt from Option Explicit: the name becomes
+			// an implicit procedure-local variable, matching Microsoft VBScript.
+			if c.optionExplicit && !c.insideClassMethod {
 				panic(c.vbCompileError(vbscript.VariableNotDefined, fmt.Sprintf("Variable not defined: '%s'", name)))
 			}
 			lidx := c.locals.Add(name)
@@ -1648,7 +1656,10 @@ func (c *Compiler) resolveSetVar(name string) (OpCode, int) {
 				return OpSetGlobal, gidx
 			}
 		}
-		if c.optionExplicit {
+		// Class member bodies are exempt from Option Explicit: assignment to an
+		// undeclared name creates an implicit procedure-local variable, matching
+		// Microsoft VBScript behavior inside Class methods and property procedures.
+		if c.optionExplicit && !c.insideClassMethod {
 			panic(c.vbCompileError(vbscript.VariableNotDefined, fmt.Sprintf("Variable not defined: '%s'", name)))
 		}
 		idx := c.locals.Add(name)
@@ -1869,13 +1880,24 @@ func (c *Compiler) skipTopLevelDefinitionBlock(endKeyword vbscript.Keyword) {
 	}
 }
 
-// isArrayAssignmentAhead checks whether the tokens following an identifier like name( ... ) are followed by '='
+// isArrayAssignmentAhead reports whether the parenthesised index list owned by the
+// current statement identifier is terminated by '=' (indexed assignment) instead of
+// starting a procedure-call argument list.
+//
+// The opening parenthesis is already consumed in statement position: parseStatement
+// runs c.move() over the identifier, so c.next holds the '(' while c.lexer is parked
+// AFTER it. Depth therefore starts at 1 whenever c.next is '('. The pre-scan caller
+// (prebindTopLevelDimDeclarations) leaves c.next on the identifier and the lexer on
+// the '(', which the same initialization handles without an off-by-one.
 func (c *Compiler) isArrayAssignmentAhead() bool {
 	if c == nil || c.lexer == nil {
 		return false
 	}
 	lexerCopy := *c.lexer
 	depth := 0
+	if p, ok := c.next.(*vbscript.PunctuationToken); ok && p.Type == vbscript.PunctLParen {
+		depth = 1
+	}
 	for {
 		tok := lexerCopy.NextToken()
 		if tok == nil {
@@ -1891,11 +1913,20 @@ func (c *Compiler) isArrayAssignmentAhead() bool {
 			case vbscript.PunctRParen:
 				depth--
 				if depth == 0 {
-					nextTok := lexerCopy.NextToken()
-					if np, ok := nextTok.(*vbscript.PunctuationToken); ok && np.Type == vbscript.PunctEqual {
-						return true
+					// Tolerate comments between the closing parenthesis and '='.
+					for {
+						nextTok := lexerCopy.NextToken()
+						if nextTok == nil {
+							return false
+						}
+						if _, ok := nextTok.(*vbscript.CommentToken); ok {
+							continue
+						}
+						if np, ok := nextTok.(*vbscript.PunctuationToken); ok && np.Type == vbscript.PunctEqual {
+							return true
+						}
+						return false
 					}
-					return false
 				}
 			}
 		}
