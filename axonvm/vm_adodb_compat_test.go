@@ -46,6 +46,21 @@ func TestADODBDateTimeValuePreservesDateType(t *testing.T) {
 	}
 }
 
+func TestJScriptConnectionPropertiesExposeDatabaseMetadata(t *testing.T) {
+	host := NewMockHost()
+	source := `<%@ Language="JScript" %><%
+var db = Server.CreateObject("ADODB.Connection");
+db.Open("sqlite::memory:");
+Response.Write(String(db.Properties("DBMS Name")) + "|");
+Response.Write(String(db.Properties("DBMS Version")).length > 0 ? "version" : "missing");
+Response.Write("|" + String(db.Properties("Current Catalog")));
+db.Close();
+%>`
+	if got := runASPSourceForTestWithHost(t, source, host); got != "SQLite|version|main" {
+		t.Fatalf("unexpected connection properties: %q", got)
+	}
+}
+
 // TestVMServerFSOGetStandardStreamCompatibility verifies GetStandardStream returns TextStream objects with stable cursor properties.
 func TestVMServerFSOGetStandardStreamCompatibility(t *testing.T) {
 	vm := NewVM(nil, nil, 5)
