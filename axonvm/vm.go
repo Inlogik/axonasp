@@ -6726,30 +6726,25 @@ func (vm *VM) dispatchNativeCall(objID int64, member string, args []Value) Value
 			return emptyForCtx()
 		case strings.EqualFold(member, "QueryString"):
 			if len(args) >= 1 {
-				if value, ok := request.QueryString.GetSelectedValue(args[0].String()); ok {
-					return vm.newRequestCollectionValueItem(value)
-				}
-				return emptyForCtx()
+				// A missing entry still has Count = 0 in Classic ASP.
+				value, _ := request.QueryString.GetSelectedValue(args[0].String())
+				return vm.newRequestCollectionValueItem(value)
 			}
 			return emptyForCtx()
 		case strings.EqualFold(member, "Form"):
 			if len(args) >= 1 {
 				if request.IsBinaryReadUsed() {
-					return emptyForCtx()
+					return vm.newRequestCollectionValueItem(asp.RequestCollectionValue{})
 				}
 				request.MarkFormUsed()
-				if value, ok := request.Form.GetSelectedValue(args[0].String()); ok {
-					return vm.newRequestCollectionValueItem(value)
-				}
-				return emptyForCtx()
+				value, _ := request.Form.GetSelectedValue(args[0].String())
+				return vm.newRequestCollectionValueItem(value)
 			}
 			return emptyForCtx()
 		case strings.EqualFold(member, "Cookies"):
 			if len(args) == 1 {
-				if value, ok := request.Cookies.GetSelectedValue(args[0].String()); ok {
-					return vm.newRequestCollectionValueItem(value)
-				}
-				return emptyForCtx()
+				value, _ := request.Cookies.GetSelectedValue(args[0].String())
+				return vm.newRequestCollectionValueItem(value)
 			}
 			if len(args) >= 2 {
 				return NewString(request.GetCookieAttribute(args[0].String(), args[1].String()))

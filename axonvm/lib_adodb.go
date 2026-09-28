@@ -398,6 +398,11 @@ func (vm *VM) dispatchADODBConnectionMethod(conn *adodbConnection, member string
 		return Value{Type: VTEmpty}
 	case strings.EqualFold(member, "OpenSchema"):
 		return vm.adodbConnectionOpenSchema(conn, args)
+	case strings.EqualFold(member, "Properties"):
+		if len(args) > 0 {
+			return vm.adodbConnectionPropertyValue(conn, args[0].String())
+		}
+		return Value{Type: VTEmpty}
 	case strings.EqualFold(member, "Errors"):
 		// Microsoft JScript permits the ADO default-property shorthand
 		// conn.Errors(index), which is compiled as a member call on Connection.
@@ -437,6 +442,49 @@ func (vm *VM) dispatchADODBConnectionPropertyGet(conn *adodbConnection, member s
 		return vm.newADODBErrorsCollection(conn)
 	}
 	return Value{Type: VTEmpty}
+}
+
+// adodbConnectionPropertyValue exposes common provider metadata through the
+// Connection.Properties(name) default-item shorthand used by Classic ASP.
+// Values requiring a live server are queried on the connection pinned by Open,
+// rather than guessed from the connection string (which may use a host alias).
+func (vm *VM) adodbConnectionPropertyValue(conn *adodbConnection, name string) Value {
+	if conn == nil || conn.state != adStateOpen || conn.dbConn == nil {
+		return Value{Type: VTEmpty}
+	}
+	var query string
+	switch conn.dbDriver {
+	case "mssql":
+		switch {
+		case strings.EqualFold(name, "DBMS Name"):
+			return NewString("Microsoft SQL Server")
+		case strings.EqualFold(name, "DBMS Version"):
+			query = "SELECT CONVERT(varchar(128), SERVERPROPERTY('ProductVersion'))"
+		case strings.EqualFold(name, "Current Catalog"):
+			query = "SELECT DB_NAME()"
+		case strings.EqualFold(name, "Server Name"):
+			query = "SELECT @@SERVERNAME"
+		}
+	case "sqlite":
+		switch {
+		case strings.EqualFold(name, "DBMS Name"):
+			return NewString("SQLite")
+		case strings.EqualFold(name, "DBMS Version"):
+			query = "SELECT sqlite_version()"
+		case strings.EqualFold(name, "Current Catalog"):
+			return NewString("main")
+		}
+	}
+	if query == "" {
+		return Value{Type: VTEmpty}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var result sql.NullString
+	if err := conn.dbConn.QueryRowContext(ctx, query).Scan(&result); err != nil || !result.Valid {
+		return Value{Type: VTEmpty}
+	}
+	return NewString(result.String)
 }
 
 func (vm *VM) dispatchADODBConnectionPropertySet(conn *adodbConnection, member string, val Value) bool {
