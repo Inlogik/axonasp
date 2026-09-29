@@ -1356,7 +1356,7 @@ func vbsAxonEnumValues(vm *VM, args []Value) (Value, error) {
 	if rs, ok := vm.adodbFieldsCollectionItems[target.Num]; ok && rs != nil {
 		values := make([]Value, 0, len(rs.columns))
 		for i := 0; i < len(rs.columns); i++ {
-			values = append(values, vm.newADODBFieldProxy(rs, rs.columns[i]))
+			values = append(values, vm.newADODBFieldProxyByOrdinal(rs, i))
 		}
 		return ValueFromVBArray(NewVBArrayFromValues(0, values)), nil
 	}

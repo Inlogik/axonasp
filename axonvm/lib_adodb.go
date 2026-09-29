@@ -913,6 +913,13 @@ func (vm *VM) dispatchADODBRecordsetMethod(rs *adodbRecordset, member string, ar
 		return Value{Type: VTEmpty}
 	case strings.EqualFold(member, "Fields.Item"):
 		if len(args) > 0 {
+			if args[0].Type == VTInteger || args[0].Type == VTDouble {
+				idx := vm.asInt(args[0])
+				if idx >= 0 && idx < len(rs.columns) {
+					return vm.newADODBFieldProxyByOrdinal(rs, idx)
+				}
+				return Value{Type: VTEmpty}
+			}
 			return vm.newADODBFieldProxy(rs, args[0].String())
 		}
 		return Value{Type: VTEmpty}
@@ -1014,8 +1021,23 @@ func (vm *VM) dispatchADODBRecordsetMethod(rs *adodbRecordset, member string, ar
 						}
 					}
 					key := vm.adodbRecordsetResolveColumnKey(rs, args[0])
+					if key == "" && (args[0].Type == VTInteger || args[0].Type == VTDouble) {
+						idx := vm.asInt(args[0])
+						if idx >= 0 && idx < len(rs.columns) {
+							key = adodbDuplicateColumnKey(idx)
+						}
+					}
 					if key != "" {
 						if len(args) > 1 {
+							if args[0].Type == VTInteger || args[0].Type == VTDouble {
+								idx := vm.asInt(args[0])
+								if rs.columnIndexByLower == nil {
+									vm.adodbRecordsetRebuildColumnIndex(rs)
+								}
+								if key != adodbDuplicateColumnKey(idx) && rs.columnIndexByLower[key] != idx {
+									key = adodbDuplicateColumnKey(idx)
+								}
+							}
 							row[key] = args[len(args)-1]
 							if rs.editMode != adEditAdd {
 								rs.editMode = adEditInProgress
@@ -1037,7 +1059,7 @@ func (vm *VM) dispatchADODBRecordsetMethod(rs *adodbRecordset, member string, ar
 		if args[0].Type == VTInteger || args[0].Type == VTDouble {
 			idx := vm.asInt(args[0])
 			if idx >= 0 && idx < len(rs.columns) {
-				return vm.newADODBFieldProxy(rs, rs.columns[idx])
+				return vm.newADODBFieldProxyByOrdinal(rs, idx)
 			}
 			return Value{Type: VTEmpty}
 		}
@@ -1457,9 +1479,8 @@ func (vm *VM) adodbRecordsetRebuildColumnIndex(rs *adodbRecordset) {
 		if key == "" {
 			continue
 		}
-		if _, exists := rs.columnIndexByLower[key]; !exists {
-			rs.columnIndexByLower[key] = idx
-		}
+		// ADO Fields.Item(name) selects the final matching field.
+		rs.columnIndexByLower[key] = idx
 	}
 }
 
@@ -1477,10 +1498,50 @@ func (vm *VM) adodbRecordsetValueByOrdinal(rs *adodbRecordset, row map[string]Va
 	if rs == nil || row == nil || index < 0 || index >= len(rs.columns) {
 		return Value{Type: VTEmpty}
 	}
-	if value, ok := row[strings.ToLower(strings.TrimSpace(rs.columns[index]))]; ok {
+	if duplicate, exists := row[adodbDuplicateColumnKey(index)]; exists {
+		return duplicate
+	}
+	key := strings.ToLower(strings.TrimSpace(rs.columns[index]))
+	// Unnamed expressions still have a value in ADO (for example SELECT 1),
+	// and older in-memory recordsets may store that value under an empty key.
+	if key == "" {
+		return row[key]
+	}
+	if rs.columnIndexByLower == nil {
+		vm.adodbRecordsetRebuildColumnIndex(rs)
+	}
+	if rs.columnIndexByLower[key] != index {
+		return Value{Type: VTEmpty}
+	}
+	if value, ok := row[key]; ok {
 		return value
 	}
 	return Value{Type: VTEmpty}
+}
+
+// adodbDuplicateColumnKey keeps earlier duplicate-name values addressable by
+// ordinal while the named key resolves to the final occurrence, as in ADO.
+func adodbDuplicateColumnKey(index int) string {
+	return "\x00" + strconv.Itoa(index)
+}
+
+func adodbStoreColumnValue(row map[string]Value, columns []string, index int, value Value) {
+	key := strings.ToLower(strings.TrimSpace(columns[index]))
+	if key == "" {
+		row[adodbDuplicateColumnKey(index)] = value
+		return
+	}
+	if previousValue, exists := row[key]; exists {
+		// When another occurrence arrives, move the previous value to its
+		// ordinal slot and let the named key point to the latest occurrence.
+		for previous := index - 1; previous >= 0; previous-- {
+			if strings.EqualFold(strings.TrimSpace(columns[previous]), key) {
+				row[adodbDuplicateColumnKey(previous)] = previousValue
+				break
+			}
+		}
+	}
+	row[key] = value
 }
 
 // adodbRecordsetClearPendingUpdateFields resets tracked changed columns for one recordset edit cycle.
@@ -1612,8 +1673,8 @@ func (vm *VM) adodbRecordsetLoadCurrentSQLResultSet(rs *adodbRecordset) {
 		}
 
 		rowMap := make(map[string]Value, len(cols))
-		for i, col := range cols {
-			rowMap[strings.ToLower(col)] = vm.adodbValueToVMValue(rowValues[i])
+		for i := range cols {
+			adodbStoreColumnValue(rowMap, cols, i, vm.adodbValueToVMValue(rowValues[i]))
 		}
 		rs.data = append(rs.data, rowMap)
 	}
@@ -2191,7 +2252,7 @@ func (vm *VM) adodbRecordsetGetRows(rs *adodbRecordset, args []Value) Value {
 	for c := range cols {
 		rowArray := NewVBArray(0, rows)
 		for r := range rows {
-			rowArray.Values[r] = rs.data[r][strings.ToLower(rs.columns[c])]
+			rowArray.Values[r] = vm.adodbRecordsetValueByOrdinal(rs, rs.data[r], c)
 		}
 		colArray.Values[c] = Value{Type: VTArray, Arr: rowArray}
 	}
@@ -2207,7 +2268,7 @@ func (vm *VM) adodbRecordsetGetString(rs *adodbRecordset, args []Value) Value {
 	for r := 0; r < rs.recordCount; r++ {
 		row := rs.data[r]
 		for c := 0; c < len(rs.columns); c++ {
-			sb.WriteString(row[strings.ToLower(rs.columns[c])].String())
+			sb.WriteString(vm.adodbRecordsetValueByOrdinal(rs, row, c).String())
 			if c < len(rs.columns)-1 {
 				sb.WriteString("\t")
 			}
@@ -2510,7 +2571,7 @@ func (vm *VM) dispatchADODBFieldsCollectionMethod(objID int64, member string, ar
 			if args[0].Type == VTInteger {
 				idx := int(args[0].Num)
 				if idx >= 0 && idx < len(rs.columns) {
-					return vm.newADODBFieldProxy(rs, rs.columns[idx]), true
+					return vm.newADODBFieldProxyByOrdinal(rs, idx), true
 				}
 				return Value{Type: VTEmpty}, true
 			}
@@ -2603,6 +2664,39 @@ func (vm *VM) newADODBFieldProxy(rs *adodbRecordset, name string) Value {
 	lowerName := strings.ToLower(strings.TrimSpace(name))
 	vm.adodbFieldItems[objID] = &adodbFieldProxy{rs: rs, name: name, cachedLowerName: lowerName}
 	return Value{Type: VTNativeObject, Num: objID}
+}
+
+func (vm *VM) newADODBFieldProxyByOrdinal(rs *adodbRecordset, index int) Value {
+	field := vm.newADODBFieldProxy(rs, rs.columns[index])
+	key := strings.ToLower(strings.TrimSpace(rs.columns[index]))
+	if key == "" {
+		ordinalKey := adodbDuplicateColumnKey(index)
+		vm.adodbFieldItems[field.Num].cachedLowerName = ordinalKey
+		// Providers expose SELECT 1 with an empty Field.Name. Metadata is
+		// recorded under that empty name; preserve it for ordinal field access.
+		if fieldType, ok := rs.columnTypeByName[key]; ok {
+			rs.columnTypeByName[ordinalKey] = fieldType
+		} else if index < len(rs.columnTypes) {
+			rs.columnTypeByName[ordinalKey] = adodbTypeFromDatabaseType(rs.columnTypes[index])
+		}
+		if size, ok := rs.columnSizeByName[key]; ok {
+			rs.columnSizeByName[ordinalKey] = size
+		}
+		if attributes, ok := rs.columnAttrByName[key]; ok {
+			rs.columnAttrByName[ordinalKey] = attributes
+		}
+		if scale, ok := rs.columnScaleByName[key]; ok {
+			rs.columnScaleByName[ordinalKey] = scale
+		}
+		return field
+	}
+	if rs.columnIndexByLower == nil {
+		vm.adodbRecordsetRebuildColumnIndex(rs)
+	}
+	if rs.columnIndexByLower[key] != index {
+		vm.adodbFieldItems[field.Num].cachedLowerName = adodbDuplicateColumnKey(index)
+	}
+	return field
 }
 
 type adodbFieldProxy struct {
@@ -5604,11 +5698,7 @@ func (vm *VM) adodbHydrateRecordsetDataFromFieldMajorValues(rs *adodbRecordset, 
 		row := make(map[string]Value, fieldCount)
 		base := rowIdx * fieldCount
 		for colIdx := range fieldCount {
-			key := strings.ToLower(strings.TrimSpace(rs.columns[colIdx]))
-			if key == "" {
-				continue
-			}
-			row[key] = vm.adodbValueToVMValue(values[base+colIdx])
+			adodbStoreColumnValue(row, rs.columns, colIdx, vm.adodbValueToVMValue(values[base+colIdx]))
 		}
 		data[rowIdx] = row
 	}
@@ -5646,10 +5736,7 @@ func (vm *VM) adodbPopulateRecordsetFromOLEFieldWalk(rs *adodbRecordset, fields 
 			}
 			valRes, _ := oleutil.GetProperty(item, "Value")
 			if valRes != nil {
-				key := strings.ToLower(strings.TrimSpace(rs.columns[i]))
-				if key != "" {
-					row[key] = vm.adodbValueToVMValue(valRes.Value())
-				}
+				adodbStoreColumnValue(row, rs.columns, i, vm.adodbValueToVMValue(valRes.Value()))
 				valRes.Clear()
 			}
 			item.Release()
