@@ -1353,13 +1353,15 @@ func vbsAxonEnumValues(vm *VM, args []Value) (Value, error) {
 		return ValueFromVBArray(NewVBArrayFromValues(0, values)), nil
 	}
 
-	if rs, ok := vm.adodbFieldsCollectionItems[target.Num]; ok && rs != nil {
-		values := make([]Value, 0, len(rs.columns))
-		for i := 0; i < len(rs.columns); i++ {
-			values = append(values, vm.newADODBFieldProxyByOrdinal(rs, i))
+	/*
+		if rs, ok := vm.adodbFieldsCollectionItems[target.Num]; ok && rs != nil {
+			values := make([]Value, 0, len(rs.columns))
+			for i := 0; i < len(rs.columns); i++ {
+				values = append(values, vm.newADODBFieldProxyByOrdinal(rs, i))
+			}
+			return ValueFromVBArray(NewVBArrayFromValues(0, values)), nil
 		}
-		return ValueFromVBArray(NewVBArrayFromValues(0, values)), nil
-	}
+	*/
 
 	// ADOX.Tables collection — yield one VTNativeObject per table item.
 	if tables, ok := vm.adoxTablesItems[target.Num]; ok && tables != nil {
