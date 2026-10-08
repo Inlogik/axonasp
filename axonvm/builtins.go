@@ -4,7 +4,7 @@
  * AxonASP Server
  * Copyright (C) 2026 G3pix Ltda. All rights reserved.
  *
- * Developed by Lucas Guimarães - G3pix Ltda
+ * Developed by Lucas Guimarães - G3pix Ltda, Yuri Eisman (@yeisman)
  * Contact: https://g3pix.com.br
  * Project URL: https://g3pix.com.br/axonasp
  *
@@ -820,7 +820,8 @@ func vbsParseNumericString(text string) (float64, vbscript.VBSyntaxErrorCode, bo
 		return sign * float64(parsed), 0, true
 	}
 
-	parsed, err := strconv.ParseFloat(trimmed, 64)
+	// Grouping commas ("1,538", as FormatNumber emits) are accepted like IsNumeric does.
+	parsed, err := strconv.ParseFloat(strings.ReplaceAll(trimmed, ",", ""), 64)
 	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
 		return 0, vbscript.TypeMismatch, false
 	}
