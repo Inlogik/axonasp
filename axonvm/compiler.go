@@ -2,7 +2,7 @@
  * AxonASP Server
  * Copyright (C) 2026 G3pix Ltda. All rights reserved.
  *
- * Developed by Lucas Guimarães - G3pix Ltda
+ * Developed by Lucas Guimarães - G3pix Ltda, Yuri Eisman (@yeisman)
  * Contact: https://g3pix.com.br
  * Project URL: https://g3pix.com.br/axonasp
  *
@@ -1177,8 +1177,8 @@ func preprocessASPIncludesWithDepsWithOptions(source string, sourceName string, 
 
 		mergeSourceMap(&sourceMap, childMap, currentMergedLine)
 		builder.WriteString(expanded)
-		currentMergedLine += countLogicalLines(expanded)
-		currentSourceLine += countLogicalLines(source[replaceStart:replaceEnd])
+		currentMergedLine += countLineBreaks(expanded)
+		currentSourceLine += countLineBreaks(source[replaceStart:replaceEnd])
 		cursor = replaceEnd
 	}
 
@@ -1283,18 +1283,6 @@ func countLineBreaks(s string) int {
 	return count
 }
 
-// countLogicalLines returns legacy logical-line count (minimum 1 for non-empty segments).
-func countLogicalLines(s string) int {
-	if s == "" {
-		return 0
-	}
-	breaks := countLineBreaks(s)
-	if strings.HasSuffix(s, "\n") || strings.HasSuffix(s, "\r") {
-		return breaks
-	}
-	return breaks + 1
-}
-
 // appendMappedSegment appends one source segment and updates merged/source line cursors.
 func appendMappedSegment(builder *strings.Builder, sourceMap *SourceMap, segment string, sourceName string, currentMergedLine *int, currentSourceLine *int) {
 	if segment == "" {
@@ -1302,9 +1290,9 @@ func appendMappedSegment(builder *strings.Builder, sourceMap *SourceMap, segment
 	}
 	sourceMap.AddBoundary(*currentMergedLine, sourceName, *currentSourceLine)
 	builder.WriteString(segment)
-	logicalLines := countLogicalLines(segment)
-	*currentMergedLine += logicalLines
-	*currentSourceLine += logicalLines
+	breaks := countLineBreaks(segment)
+	*currentMergedLine += breaks
+	*currentSourceLine += breaks
 }
 
 // mergeSourceMap appends one child source map into a parent map at one merged-line offset.
