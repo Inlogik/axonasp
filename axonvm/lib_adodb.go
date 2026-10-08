@@ -4,7 +4,7 @@
  * AxonASP Server
  * Copyright (C) 2026 G3pix Ltda. All rights reserved.
  *
- * Developed by Lucas Guimarães - G3pix Ltda
+ * Developed by Lucas Guimarães - G3pix Ltda, Yuri Eisman (@yeisman)
  * Contact: https://g3pix.com.br
  * Project URL: https://g3pix.com.br/axonasp
  *
@@ -42,7 +42,7 @@ import (
 	"unicode/utf16"
 
 	"g3pix.com.br/axonasp/v2/vbscript"
-	_ "github.com/denisenkom/go-mssqldb"
+	mssql "github.com/denisenkom/go-mssqldb"
 	"github.com/go-ole/go-ole"
 	"github.com/go-ole/go-ole/oleutil"
 	_ "github.com/go-sql-driver/mysql"
@@ -1674,7 +1674,11 @@ func (vm *VM) adodbRecordsetLoadCurrentSQLResultSet(rs *adodbRecordset) {
 
 		rowMap := make(map[string]Value, len(cols))
 		for i := range cols {
-			adodbStoreColumnValue(rowMap, cols, i, vm.adodbValueToVMValue(rowValues[i]))
+			value := rowValues[i]
+			if i < len(rs.columnTypes) && rs.columnTypes[i] == "UNIQUEIDENTIFIER" {
+				value = adodbSQLServerGUIDText(value)
+			}
+			adodbStoreColumnValue(rowMap, cols, i, vm.adodbValueToVMValue(value))
 		}
 		rs.data = append(rs.data, rowMap)
 	}
@@ -4105,6 +4109,16 @@ func (vm *VM) adodbValueToVMValue(v any) Value {
 		return NewString(string(val))
 	}
 	return NewString(fmt.Sprintf("%v", v))
+}
+
+// adodbSQLServerGUIDText formats a SQL Server uniqueidentifier, which the driver returns as
+// 16 raw bytes in SQL Server's mixed-endian order, the way ADO does: "{XXXXXXXX-XXXX-...}".
+func adodbSQLServerGUIDText(v any) any {
+	var guid mssql.UniqueIdentifier
+	if guid.Scan(v) != nil {
+		return v
+	}
+	return "{" + guid.String() + "}"
 }
 
 // adodbExecuteArgs converts ADODB.Connection.Execute optional parameter payload
