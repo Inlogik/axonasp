@@ -4,7 +4,7 @@
  * AxonASP Server
  * Copyright (C) 2026 G3pix Ltda. All rights reserved.
  *
- * Developed by Lucas Guimarães - G3pix Ltda
+ * Developed by Lucas Guimarães - G3pix Ltda, Yuri Eisman (@yeisman)
  * Contact: https://g3pix.com.br
  * Project URL: https://g3pix.com.br/axonasp
  *
@@ -54,6 +54,11 @@ func TestADODBIsQueryRowReturningStatements(t *testing.T) {
 		"(  /* x */ WITH cte AS (SELECT 1) SELECT * FROM cte )",
 		// RETURNING token preceded by another clause.
 		"INSERT INTO t (a) SELECT a FROM s RETURNING id",
+		// Stored procedure calls.
+		"EXEC dbo.sp_test",
+		"exec [RPT_salesperday] @companyid=1",
+		"EXECUTE sp_test 1, 'a'",
+		"CALL sp_test(1)",
 	}
 
 	for _, sql := range queries {
@@ -77,7 +82,8 @@ func TestADODBIsQueryNonQueryStatements(t *testing.T) {
 		"CREATE TABLE t (a INT)",
 		"DROP TABLE t",
 		"BEGIN TRANSACTION",
-		"EXEC dbo.sp_test",
+		"executed",
+		"calls",
 		"SET NOCOUNT ON",
 		"TRUNCATE TABLE t",
 		// Keyword present only inside a string literal.

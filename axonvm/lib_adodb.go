@@ -3775,6 +3775,14 @@ func (vm *VM) adodbIsQuery(sql string) bool {
 		return true
 	}
 
+	// Stored procedure calls can return result sets
+	// (SQL Server EXEC/EXECUTE, MySQL CALL).
+	if adodbHasSQLKeywordPrefix(trimmed, "exec") ||
+		adodbHasSQLKeywordPrefix(trimmed, "execute") ||
+		adodbHasSQLKeywordPrefix(trimmed, "call") {
+		return true
+	}
+
 	// DML statements only return a result set when they carry a RETURNING clause.
 	if adodbHasSQLKeywordPrefix(trimmed, "insert") ||
 		adodbHasSQLKeywordPrefix(trimmed, "update") ||
