@@ -4,7 +4,7 @@
  * AxonASP Server
  * Copyright (C) 2026 G3pix Ltda. All rights reserved.
  *
- * Developed by Lucas Guimarães - G3pix Ltda
+ * Developed by Lucas Guimarães - G3pix Ltda, Yuri Eisman (@yeisman)
  * Contact: https://g3pix.com.br
  * Project URL: https://g3pix.com.br/axonasp
  *
@@ -3768,6 +3768,14 @@ func (vm *VM) adodbIsQuery(sql string) bool {
 		adodbHasSQLKeywordPrefix(trimmed, "show") ||
 		adodbHasSQLKeywordPrefix(trimmed, "pragma") ||
 		adodbHasSQLKeywordPrefix(trimmed, "with") {
+		return true
+	}
+
+	// Stored procedure calls can return result sets
+	// (SQL Server EXEC/EXECUTE, MySQL CALL).
+	if adodbHasSQLKeywordPrefix(trimmed, "exec") ||
+		adodbHasSQLKeywordPrefix(trimmed, "execute") ||
+		adodbHasSQLKeywordPrefix(trimmed, "call") {
 		return true
 	}
 
